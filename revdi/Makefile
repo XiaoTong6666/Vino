@@ -1,59 +1,36 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# Top-level build for revdi: the Rust EVDI kernel module (module/), the
-# ABI-compatible Rust libevdi (library/), and the chimera rig (chimera/) that
-# drives a DL3 dock straight from userspace.
-#
-# The kernel module needs a kernel tree that carries the Rust DRM/KMS bindings
-# (a stock distro kernel will not build it yet); point KDIR at it:
-#
-#   make KDIR=/path/to/drm-next
-#   sudo make install KDIR=/path/to/drm-next
-#
-# The library and chimera build against the system Rust toolchain and have no
-# such requirement -- this project vendors the kernel sources it needs (see
-# `make sync`), so both build with no kernel tree present at all.
+# Top-level build for the userspace Vino service. The display kernel module and
+# libevdi come from the stock EVDI project in /home/xiaotong/evdi (or the
+# system installation); this tree owns only the dock-side implementation.
 
-KDIR ?= /lib/modules/$(shell uname -r)/build
 CARGO ?= cargo
+EVDI_DIR ?= ../evdi
 
-all: module library
+all: chimera
 
-module:
-	$(MAKE) -C module KDIR=$(KDIR)
+# The complete EVDI-to-Vino userspace service.
+chimera: evdi
+	EVDI_LIB_DIR=$(abspath $(EVDI_DIR)/library) \
+		$(CARGO) build --release -p vino-chimera --bin chimera --features live
 
-library:
-	$(MAKE) -C library
-
-# The complete Revdi-to-Vino userspace service.
-chimera:
-	$(CARGO) build --release -p vino-chimera --bin chimera --features live,revdi
+evdi:
+	$(MAKE) -C $(EVDI_DIR)/library
 
 # The offline proof: replays real captured DLM sessions through the vendored
 # kernel control-plane code and asserts byte-exact equivalence. No hardware.
 test:
+	python3 -c 'compile(open("scripts/hardware_test.py", encoding="utf-8").read(), "scripts/hardware_test.py", "exec")'
 	$(CARGO) test --workspace
-	$(CARGO) test --manifest-path library/Cargo.toml
 
-# Refresh the vendored kernel sources (module/*.rs, chimera/vino/*.rs) from a
-# kernel tree. `check-sync` reports drift without writing anything.
-sync:
-	./scripts/sync-kernel-sources.sh $(if $(KSRC),$(KSRC),)
-
-check-sync:
-	./scripts/sync-kernel-sources.sh --check $(if $(KSRC),$(KSRC),)
-
-install: install-module install-library
-
-install-module:
-	$(MAKE) -C module modules_install KDIR=$(KDIR)
-
-install-library:
-	$(MAKE) -C library install
+lint: evdi
+	EVDI_LIB_DIR=$(abspath $(EVDI_DIR)/library) \
+		LD_LIBRARY_PATH=$(abspath $(EVDI_DIR)/library) \
+		$(CARGO) clippy --workspace --all-targets \
+			--features vino-chimera/live -- -D warnings
 
 clean:
-	$(MAKE) -C module clean KDIR=$(KDIR)
-	$(MAKE) -C library clean
+	$(MAKE) -C $(EVDI_DIR)/library clean
 	$(CARGO) clean
 
-.PHONY: all module library chimera test sync check-sync install install-module install-library clean
+.PHONY: all chimera evdi test lint clean

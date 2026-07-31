@@ -4,15 +4,18 @@ use crate::kvino;
 use std::time::{Duration, Instant};
 use vino_driver::{Dock, Error as UsbError};
 
-const STEP_DELAY: Duration = Duration::from_millis(100);
-const POLL_DELAY: Duration = Duration::from_millis(20);
-const RECV_TIMEOUT: Duration = Duration::from_millis(5);
-const ASYNC_EDID_WAIT: Duration = Duration::from_secs(2);
-const POLL_WALL_TIME: Duration = Duration::from_secs(6);
-const EARLY_ROUNDS: usize = 1;
-const POLL_ITERS: usize = 250;
-const POLL_PROBE_EVERY: usize = 8;
-const FINAL_FETCH_ROUNDS: usize = 24;
+const ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_DELAY: Duration = Duration::from_millis(100);
+const SETTLE_DELAY: Duration = Duration::from_millis(100);
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
+const PLACEHOLDER_REFETCH_POLLS: usize = 8;
+
+fn trace(message: &str) {
+    if std::env::var_os("VINO_TRACE_EDID").is_some() {
+        eprintln!("[edid] {message}");
+    }
+}
 
 #[derive(Debug)]
 pub enum FetchError {
@@ -65,31 +68,115 @@ fn send_message(
     Ok(())
 }
 
-/// Drain one pending EP84 reply (short timeout — this is a rehearsal loop, not the persistent
-/// async queue `vino.ko` keeps). Opportunistically captures a real EDID and reports whether this
-/// reply was a `sub=0x0020` probe whose readiness bit is set.
-fn drain_once(
+fn receive_status(
     dock: &Dock,
     ks: &[u8; 16],
     riv: &[u8; 8],
-    edid: &mut Option<Vec<u8>>,
-) -> Result<bool, FetchError> {
-    let reply = match dock.recv_frame_raw_timeout(4096, RECV_TIMEOUT) {
-        Ok(reply) => reply,
-        Err(UsbError::Timeout) => return Ok(false),
-        Err(e) => return Err(FetchError::Transport(e)),
-    };
-    if edid.is_none() {
-        if let Some(decoded) =
-            kvino::parse_edid_from_reply(ks, riv, &reply).map_err(FetchError::Build)?
-        {
-            *edid = Some(decoded);
+    deadline: Instant,
+) -> Result<Option<(u8, bool, u16)>, FetchError> {
+    while Instant::now() < deadline {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let reply = match dock.recv_frame_raw_timeout(4096, timeout) {
+            Ok(reply) => reply,
+            Err(UsbError::Timeout) => return Ok(None),
+            Err(error) => return Err(FetchError::Transport(error)),
+        };
+        trace(&format!(
+            "status rx bytes={} header={:02x?} decoded={:?} sample={:?}",
+            reply.len(),
+            &reply[..reply.len().min(16)],
+            kvino::decode_in_lenient(ks, riv, &reply),
+            kvino::decode_any(ks, riv, &reply)
+        ));
+        if let Some(status) = kvino::parse_edid_status(ks, riv, &reply) {
+            trace(&format!(
+                "status presence={} available={} length={}",
+                status.0, status.1, status.2
+            ));
+            return Ok(Some(status));
+        }
+        if matches!(
+            kvino::decode_in_lenient(ks, riv, &reply),
+            Some((0x14, 0x20, _))
+        ) {
+            return Ok(None);
         }
     }
-    Ok(matches!(
-        kvino::edid_poll_ready(ks, riv, &reply),
-        Some(true)
-    ))
+    Ok(None)
+}
+
+enum EdidReply {
+    Real(Vec<u8>),
+    Placeholder,
+    Unavailable,
+}
+
+fn receive_edid(
+    dock: &Dock,
+    ks: &[u8; 16],
+    riv: &[u8; 8],
+    declared_length: u16,
+    deadline: Instant,
+) -> Result<EdidReply, FetchError> {
+    while Instant::now() < deadline {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let reply = match dock.recv_frame_raw_timeout(4096, timeout) {
+            Ok(reply) => reply,
+            Err(UsbError::Timeout) => return Ok(EdidReply::Unavailable),
+            Err(error) => return Err(FetchError::Transport(error)),
+        };
+        trace(&format!(
+            "fetch rx bytes={} decoded={:?} expected={declared_length}",
+            reply.len(),
+            kvino::decode_in_lenient(ks, riv, &reply)
+        ));
+        if let Some(edid) = kvino::parse_edid_from_reply(ks, riv, &reply, declared_length)
+            .map_err(FetchError::Build)?
+        {
+            return Ok(EdidReply::Real(edid));
+        }
+        match kvino::decode_in_lenient(ks, riv, &reply) {
+            Some((0x114, 0x21, _)) => return Ok(EdidReply::Placeholder),
+            Some((0x194 | 0x14, 0x21, _)) => return Ok(EdidReply::Unavailable),
+            _ => {}
+        }
+    }
+    Ok(EdidReply::Unavailable)
+}
+
+fn valid_status_length(length: u16) -> bool {
+    let length = length as usize;
+    (128..=3968).contains(&length) && length % 128 == 0
+}
+
+fn drain_optional_reply(dock: &Dock) -> Result<(), FetchError> {
+    match dock.recv_frame_raw_timeout(4096, DRAIN_TIMEOUT) {
+        Ok(_) | Err(UsbError::Timeout) => Ok(()),
+        Err(error) => Err(FetchError::Transport(error)),
+    }
+}
+
+fn finalize_sink_engagement(
+    dock: &Dock,
+    ks: &[u8; 16],
+    riv: &[u8; 8],
+    wire_seq: &mut u32,
+    inner_counter: &mut u16,
+    head: u8,
+) -> Result<(), FetchError> {
+    for engage_index in 0..2 {
+        trace(&format!("sink engage head={head} index={engage_index}"));
+        send_message(dock, ks, riv, wire_seq, inner_counter, 0x16, |counter| {
+            kvino::edid_engage_req(counter, head)
+        })?;
+        drain_optional_reply(dock)?;
+        std::thread::sleep(SETTLE_DELAY);
+    }
+    trace(&format!("post-EDID capability query head={head}"));
+    send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
+        kvino::post_edid_query(counter, head)
+    })?;
+    drain_optional_reply(dock)
 }
 
 /// Discover `head`'s EDID in an already-engaged session.
@@ -104,84 +191,64 @@ pub fn fetch_edid(
     inner_counter: &mut u16,
     head: u8,
 ) -> Result<Vec<u8>, FetchError> {
-    let mut edid: Option<Vec<u8>> = None;
-    let mut ready = false;
+    let acquisition_deadline = Instant::now() + ACQUISITION_TIMEOUT;
+    let mut placeholder_length = None;
+    let mut status_polls_since_fetch = PLACEHOLDER_REFETCH_POLLS;
+    let mut attempt = 0usize;
 
-    for round in 0..EARLY_ROUNDS {
-        if edid.is_some() {
-            break;
-        }
-        println!("  chimera-edid: early round {round}");
-        for _ in 0..2 {
-            send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
-                kvino::get_edid_req_sub(counter, 0x20, head)
-            })?;
-            ready |= drain_once(dock, ks, riv, &mut edid)?;
-            std::thread::sleep(STEP_DELAY);
-        }
-        send_message(dock, ks, riv, wire_seq, inner_counter, 0x16, |counter| {
-            kvino::edid_readiness_kick(counter, head)
+    while Instant::now() < acquisition_deadline {
+        attempt += 1;
+        trace(&format!("attempt={attempt} send status head={head}"));
+        send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
+            kvino::get_edid_req_sub(counter, 0x20, head)
         })?;
-        ready |= drain_once(dock, ks, riv, &mut edid)?;
-        std::thread::sleep(STEP_DELAY);
+        let transaction_deadline = (Instant::now() + TRANSACTION_TIMEOUT).min(acquisition_deadline);
+        let Some((presence, available, length)) =
+            receive_status(dock, ks, riv, transaction_deadline)?
+        else {
+            std::thread::sleep(RETRY_DELAY);
+            continue;
+        };
+        if presence == 0 && !available {
+            return Err(FetchError::NoEdid { head });
+        }
+        if !available || !valid_status_length(length) {
+            std::thread::sleep(RETRY_DELAY);
+            continue;
+        }
+
+        status_polls_since_fetch = status_polls_since_fetch.saturating_add(1);
+        if placeholder_length == Some(length)
+            && status_polls_since_fetch < PLACEHOLDER_REFETCH_POLLS
+        {
+            std::thread::sleep(RETRY_DELAY);
+            continue;
+        }
+
+        trace(&format!(
+            "attempt={attempt} send fetch head={head} declared_length={length}"
+        ));
         send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
             kvino::get_edid_req(counter, head)
         })?;
-        ready |= drain_once(dock, ks, riv, &mut edid)?;
-        if edid.is_some() {
-            break;
+        status_polls_since_fetch = 0;
+        let transaction_deadline = (Instant::now() + TRANSACTION_TIMEOUT).min(acquisition_deadline);
+        match receive_edid(dock, ks, riv, length, transaction_deadline)? {
+            EdidReply::Real(edid) => {
+                finalize_sink_engagement(dock, ks, riv, wire_seq, inner_counter, head)?;
+                return Ok(edid);
+            }
+            EdidReply::Placeholder => {
+                trace(&format!("attempt={attempt} placeholder length={length}"));
+                placeholder_length = Some(length);
+            }
+            EdidReply::Unavailable => {
+                trace(&format!("attempt={attempt} fetch unavailable"));
+                placeholder_length = None;
+            }
         }
-        let wait_started = Instant::now();
-        while edid.is_none() && wait_started.elapsed() < ASYNC_EDID_WAIT {
-            ready |= drain_once(dock, ks, riv, &mut edid)?;
-        }
+        std::thread::sleep(RETRY_DELAY);
     }
 
-    // The receiver requires two engage messages even when the asynchronous EDID push arrived
-    // during the early fetch.
-    for _ in 0..2 {
-        send_message(dock, ks, riv, wire_seq, inner_counter, 0x16, |counter| {
-            kvino::edid_engage_req(counter, head)
-        })?;
-        ready |= drain_once(dock, ks, riv, &mut edid)?;
-        std::thread::sleep(STEP_DELAY);
-    }
-
-    if edid.is_none() {
-        let poll_started = Instant::now();
-        for i in 0..POLL_ITERS {
-            if edid.is_some() || ready || poll_started.elapsed() >= POLL_WALL_TIME {
-                break;
-            }
-            send_message(dock, ks, riv, wire_seq, inner_counter, 0x14, |counter| {
-                kvino::device_query_req(counter, 0x000c)
-            })?;
-            ready |= drain_once(dock, ks, riv, &mut edid)?;
-            if i % POLL_PROBE_EVERY == POLL_PROBE_EVERY - 1 {
-                send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
-                    kvino::get_edid_req_sub(counter, 0x20, head)
-                })?;
-                ready |= drain_once(dock, ks, riv, &mut edid)?;
-            }
-            std::thread::sleep(POLL_DELAY);
-        }
-        println!("  chimera-edid: readiness poll finished (ready={ready})");
-        for _ in 0..FINAL_FETCH_ROUNDS {
-            if edid.is_some() {
-                break;
-            }
-            send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
-                kvino::get_edid_req(counter, head)
-            })?;
-            let _ = drain_once(dock, ks, riv, &mut edid)?;
-            std::thread::sleep(POLL_DELAY);
-        }
-    }
-
-    send_message(dock, ks, riv, wire_seq, inner_counter, 0x15, |counter| {
-        kvino::post_edid_query(counter, head)
-    })?;
-    let _ = drain_once(dock, ks, riv, &mut edid)?;
-
-    edid.ok_or(FetchError::NoEdid { head })
+    Err(FetchError::NoEdid { head })
 }

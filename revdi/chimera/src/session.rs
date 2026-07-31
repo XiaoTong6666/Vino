@@ -15,9 +15,17 @@ const HDCP_HPRIME_WAIT: Duration = Duration::from_micros(165_000);
 /// Frames to drain from EP84 after each control message, matching the kernel driver's
 /// `drain_ep84`. The dock queues unprompted pushes alongside acknowledgements.
 const EP84_DRAIN_READS: usize = 16;
+const VIDEO_ARM_OPEN_SETTLE: Duration = Duration::from_millis(100);
+const VIDEO_ARM_COMMIT_SETTLE: Duration = Duration::from_millis(20);
 const SET_INTERFACE: u8 = 0x0b;
 const GET_DESCRIPTOR: u8 = 0x06;
 const HEADS: usize = 2;
+
+fn trace_control(message: &str) {
+    if std::env::var_os("VINO_TRACE_CONTROL").is_some() {
+        eprintln!("[control] {message}");
+    }
+}
 
 const STREAM_OPEN: [u8; 64] = [
     0x00, 0x00, 0x1c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -27,11 +35,19 @@ const STREAM_OPEN: [u8; 64] = [
 ];
 
 struct SessionKeys {
-    control_key: kernel::crypto::Secret<16>,
+    control_key: [u8; 16],
     control_nonce: [u8; 8],
     next_counter: u16,
-    rsa: kvino::RsaPublicKey,
+    modulus: [u8; 128],
+    exponent: [u8; 3],
     receiver_id_list: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedAkeReport {
+    pub repeater: bool,
+    pub receiver_id: [u8; 5],
+    pub receiver_id_list_len: usize,
 }
 
 /// One authenticated userspace control session.
@@ -44,18 +60,113 @@ pub struct ControlSession {
     frame_seq: [u32; HEADS],
 }
 
+struct ControlConfiguration {
+    wire_seq: u32,
+    inner_counter: u16,
+    video_keys: [[u8; 24]; HEADS],
+    acknowledgements: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerHeadReport {
+    pub head: u8,
+    pub rrx: [u8; 8],
+    pub acknowledgements: usize,
+    pub final_inner_counter: u16,
+    pub final_wire_sequence: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeProbeReport {
+    pub head: u8,
+    pub width: usize,
+    pub height: usize,
+    pub refresh_hz: u32,
+    pub padded_width: usize,
+    pub padded_height: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoArmProbeReport {
+    pub head: u8,
+    pub width: usize,
+    pub height: usize,
+    pub refresh_hz: u32,
+    pub padded_width: usize,
+    pub padded_height: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirstFrameProbeReport {
+    pub head: u8,
+    pub width: usize,
+    pub height: usize,
+    pub refresh_hz: u32,
+    pub padded_width: usize,
+    pub padded_height: usize,
+    pub encoded_bytes: usize,
+}
+
 impl ControlSession {
     /// Open the dock and establish its encrypted control channel and downstream streams.
     pub fn engage() -> Result<Self, String> {
         let dock = Dock::open().map_err(|e| format!("open DisplayLink dock: {e}"))?;
         device_open_preamble(&dock)?;
         session_init(&dock)?;
-        let mut keys = authenticate(&dock)?;
-        let (wire_seq, inner_counter, video_keys, acknowledgements) =
-            configure_control(&dock, &mut keys)?;
-        if acknowledgements == 0 {
+        let (keys, _) = authenticate(&dock)?;
+        let configuration = configure_control(&dock, &keys)?;
+        if configuration.acknowledgements == 0 {
             return Err("dock did not acknowledge the encrypted control session".into());
         }
+        Ok(Self {
+            dock,
+            keys,
+            wire_seq: configuration.wire_seq,
+            inner_counter: configuration.inner_counter,
+            video_keys: configuration.video_keys,
+            frame_seq: [0; HEADS],
+        })
+    }
+
+    /// Open the dock and stop after the shared AKE / SKE / repeater closure.
+    pub fn probe_shared_ake() -> Result<SharedAkeReport, String> {
+        let dock = Dock::open().map_err(|e| format!("open DisplayLink dock: {e}"))?;
+        device_open_preamble(&dock)?;
+        session_init(&dock)?;
+        let (_, report) = authenticate(&dock)?;
+        Ok(report)
+    }
+
+    /// Engage only one downstream head, leaving other heads untouched.
+    pub fn engage_head(head: u8) -> Result<Self, String> {
+        if usize::from(head) >= HEADS {
+            return Err(format!("invalid Vino head {head}"));
+        }
+        let dock = Dock::open().map_err(|e| format!("open DisplayLink dock: {e}"))?;
+        device_open_preamble(&dock)?;
+        session_init(&dock)?;
+        let (keys, _) = authenticate(&dock)?;
+        let mut wire_seq = 0u32;
+        let mut inner_counter = keys.next_counter;
+        let mut acknowledgements = 0usize;
+        let mut video_keys = [[0u8; 24]; HEADS];
+
+        run_control_prelude(
+            &dock,
+            &keys,
+            &mut wire_seq,
+            &mut inner_counter,
+            &mut acknowledgements,
+        )?;
+        let _rrx = configure_head(
+            &dock,
+            &keys,
+            head,
+            &mut wire_seq,
+            &mut inner_counter,
+            &mut video_keys[usize::from(head)],
+            &mut acknowledgements,
+        )?;
         Ok(Self {
             dock,
             keys,
@@ -85,12 +196,12 @@ impl ControlSession {
         let Some(reply) = self.send_control(0x15, &message)? else {
             return Ok(None);
         };
-        let Some((id, _, _)) =
-            kvino::probe_reply_status(&self.keys.control_key, &self.keys.control_nonce, &reply)
+        let Some((presence, available, _)) =
+            kvino::parse_edid_status(&self.keys.control_key, &self.keys.control_nonce, &reply)
         else {
             return Ok(None);
         };
-        Ok(Some(matches!(id, 0x44 | 0x78 | 0x194)))
+        Ok(Some(presence != 0 || available))
     }
 
     /// Send the steady-state heartbeat and reap its paired reply.
@@ -120,7 +231,11 @@ impl ControlSession {
         Some((key, nonce))
     }
 
-    /// Program a captured mode profile and train its video endpoint.
+    /// Program a captured mode profile.
+    ///
+    /// Current-firmware live captures proceed directly from mode-set to scanout. The historical
+    /// opening/commit arm burst remains available for bounded probing and can be forced here with
+    /// `VINO_VIDEO_ARM_BURST=1`, but is not part of the default long-running path.
     pub fn activate_mode(
         &mut self,
         head: u8,
@@ -128,21 +243,284 @@ impl ControlSession {
         height: usize,
         refresh_hz: u32,
     ) -> Result<(), String> {
+        let report = self.run_mode_sequence(head, width, height, refresh_hz)?;
+        if std::env::var_os("VINO_VIDEO_ARM_BURST").is_some() {
+            self.run_video_arm_sequence(
+                head,
+                width,
+                height,
+                refresh_hz,
+                report.padded_width,
+                report.padded_height,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn probe_mode(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        refresh_hz: u32,
+    ) -> Result<ModeProbeReport, String> {
+        self.run_mode_sequence(head, width, height, refresh_hz)
+    }
+
+    pub fn probe_video_arm(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        refresh_hz: u32,
+    ) -> Result<VideoArmProbeReport, String> {
+        let report = self.run_mode_sequence(head, width, height, refresh_hz)?;
+        self.run_video_arm_sequence(
+            head,
+            width,
+            height,
+            refresh_hz,
+            report.padded_width,
+            report.padded_height,
+        )?;
+        Ok(VideoArmProbeReport {
+            head,
+            width,
+            height,
+            refresh_hz,
+            padded_width: report.padded_width,
+            padded_height: report.padded_height,
+        })
+    }
+
+    pub fn probe_first_frame(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        refresh_hz: u32,
+        rgb: &[u8],
+    ) -> Result<FirstFrameProbeReport, String> {
+        let report = self.probe_video_arm(head, width, height, refresh_hz)?;
+        let (padded, padded_width, padded_height) = pad_rgb(rgb, width, height);
+        debug_assert_eq!(padded_width, report.padded_width);
+        debug_assert_eq!(padded_height, report.padded_height);
+        let encoded_bytes = self.present_rgb(head, padded_width, padded_height, &padded)?;
+        Ok(FirstFrameProbeReport {
+            head,
+            width,
+            height,
+            refresh_hz,
+            padded_width: report.padded_width,
+            padded_height: report.padded_height,
+            encoded_bytes,
+        })
+    }
+
+    /// Encode and present one padded RGB frame.
+    pub fn present_rgb(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        rgb: &[u8],
+    ) -> Result<usize, String> {
+        let head_index = usize::from(head);
+        let sequence = *self
+            .frame_seq
+            .get(head_index)
+            .ok_or_else(|| format!("invalid Vino head {head}"))?;
+        let (frames, next_sequence) =
+            kvino::colour_frame_ep08_head(width, height, rgb, sequence, head)
+                .map_err(build_error("video frame"))?;
+        let encoded_bytes = frames.iter().map(Vec::len).sum();
+        self.submit_video(head, &frames)?;
+        self.frame_seq[head_index] = next_sequence;
+        self.poll_status()?;
+        Ok(encoded_bytes)
+    }
+
+    /// Encode and present only the Vino macro-tiles selected by `clips`.
+    pub fn present_rgb_damage(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        rgb: &[u8],
+        clips: &[(usize, usize, usize, usize)],
+    ) -> Result<usize, String> {
+        let head_index = usize::from(head);
+        let sequence = *self
+            .frame_seq
+            .get(head_index)
+            .ok_or_else(|| format!("invalid Vino head {head}"))?;
+        let (frames, next_sequence) =
+            kvino::colour_frame_ep08_damage_head(width, height, rgb, sequence, head, clips)
+                .map_err(build_error("damage video frame"))?;
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        let encoded_bytes = frames.iter().map(Vec::len).sum();
+        self.submit_video(head, &frames)?;
+        self.frame_seq[head_index] = next_sequence;
+        self.poll_status()?;
+        Ok(encoded_bytes)
+    }
+
+    /// Upload a complete cursor image for one head.
+    pub fn set_cursor(
+        &mut self,
+        head: u8,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) -> Result<(), String> {
+        let width = u16::try_from(width).map_err(|_| "cursor width exceeds the wire format")?;
+        let height = u16::try_from(height).map_err(|_| "cursor height exceeds the wire format")?;
+        let create = kvino::cursor_create(self.inner_counter, head, width, height)
+            .map_err(build_error("cursor create"))?;
+        self.send_control(0x1b, &create)?;
+        let image = kvino::cursor_image(self.inner_counter, head, width, height, bgra)
+            .map_err(build_error("cursor image"))?;
+        self.send_control(0x1c, &image).map(|_| ())
+    }
+
+    /// Move a previously uploaded cursor.
+    pub fn move_cursor(&mut self, head: u8, x: i32, y: i32) -> Result<(), String> {
+        let x = u16::try_from(x.clamp(0, i32::from(u16::MAX)))
+            .map_err(|_| "cursor x position exceeds the wire format")?;
+        let y = u16::try_from(y.clamp(0, i32::from(u16::MAX)))
+            .map_err(|_| "cursor y position exceeds the wire format")?;
+        let message = kvino::cursor_move(self.inner_counter, head, x, y)
+            .map_err(build_error("cursor move"))?;
+        self.send_control(0x1a, &message).map(|_| ())
+    }
+
+    /// Blank and close a head's active stream.
+    pub fn deactivate_mode(&mut self, head: u8, width: usize, height: usize) -> Result<(), String> {
+        let padded_width = width.div_ceil(64) * 64;
+        let padded_height = height.div_ceil(16) * 16;
+        let black = kvino::black_frame_ep08(padded_width, padded_height, head)
+            .map_err(build_error("black shutdown frame"))?;
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let mut next_status = Instant::now();
+        while Instant::now() < deadline {
+            self.submit_video(head, &black)?;
+            if Instant::now() >= next_status {
+                self.poll_status()?;
+                next_status = Instant::now() + Duration::from_millis(16);
+            }
+        }
+        self.send_marker(head, 0x2f, 0)?;
+        self.send_marker(head, 0x2e, 0)?;
+        self.send_marker(head, 0x2f, 1)?;
+        self.send_marker(head, 0x2e, 1)?;
+        self.poll_status()?;
+        self.send_marker(head, 0x2f, 0)
+    }
+
+    /// Forward one Revdi DDC/CI transaction to a downstream monitor.
+    pub fn ddcci(
+        &mut self,
+        head: u8,
+        address: u16,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        const I2C_M_RD: u16 = 0x0001;
+
+        if address != kvino::DDCCI_I2C_ADDR {
+            return Err(format!("unsupported DDC/CI address {address:#04x}"));
+        }
+        if flags & I2C_M_RD == 0 {
+            let message = kvino::ddc_forward(self.inner_counter, head, payload)
+                .map_err(build_error("DDC/CI write"))?;
+            self.send_control(0x36, &message)?;
+            return Ok(Vec::new());
+        }
+
+        let message =
+            kvino::ddc_read_req(self.inner_counter, head).map_err(build_error("DDC/CI read"))?;
+        let reply = self
+            .send_control(0x15, &message)?
+            .ok_or_else(|| "dock did not return a DDC/CI read reply".to_string())?;
+        kvino::parse_ddc_reply(&self.keys.control_key, &self.keys.control_nonce, &reply)
+            .map_err(build_error("DDC/CI reply"))?
+            .ok_or_else(|| "dock returned an invalid DDC/CI read reply".to_string())
+    }
+
+    fn send_control(&mut self, id: u16, content: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let started = Instant::now();
+        trace_control(&format!(
+            "send id={id:#06x} wire_seq={} inner_counter={} content_len={}",
+            self.wire_seq,
+            self.inner_counter,
+            content.len()
+        ));
+        let frame = kvino::seal_interactive(
+            &self.keys.control_key,
+            &self.keys.control_nonce,
+            id,
+            self.wire_seq,
+            content,
+        )
+        .map_err(|e| format!("seal control message {id:#06x}: {e}"))?;
+        // Keep pumping libusb while EP84's persistent reads are in flight. The synchronous bulk
+        // write can starve those callbacks during the mode transition and leave the dock's shared
+        // EP02 queue blocked on the first status poll.
+        if let Err(error) = self.dock.write_ctrl_dlm(&frame) {
+            trace_control(&format!(
+                "send id={id:#06x} failed after {:?}: {error}",
+                started.elapsed()
+            ));
+            return Err(format!("send control message {id:#06x}: {error}"));
+        }
+        self.wire_seq = self
+            .wire_seq
+            .wrapping_add(content.len().div_ceil(16) as u32);
+        self.inner_counter = self.inner_counter.wrapping_add(1);
+        let reply = receive_optional(&self.dock, REPLY_TIMEOUT)?;
+        trace_control(&format!(
+            "send id={id:#06x} completed in {:?} reply_len={}",
+            started.elapsed(),
+            reply.as_ref().map_or(0, Vec::len)
+        ));
+        Ok(reply)
+    }
+
+    fn send_marker(&mut self, head: u8, sub: u16, state: u8) -> Result<(), String> {
+        trace_control(&format!("marker head={head} sub={sub:#06x} state={state}"));
+        let message = kvino::stream_marker(self.inner_counter, head, sub, state)
+            .map_err(build_error("stream marker"))?;
+        self.send_control(0x16, &message).map(|_| ())
+    }
+
+    fn poll_status(&mut self) -> Result<(), String> {
+        let message = kvino::device_query_req(self.inner_counter, 0x000c)
+            .map_err(build_error("status poll"))?;
+        self.send_control(0x14, &message).map(|_| ())
+    }
+
+    fn wait_mode_offset(&self, anchor: Instant, offset_ms: u64) {
+        wait_until(anchor, Duration::from_millis(offset_ms));
+    }
+
+    fn run_mode_sequence(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        refresh_hz: u32,
+    ) -> Result<ModeProbeReport, String> {
+        trace_control(&format!(
+            "mode sequence begin head={head} {width}x{height}@{refresh_hz}"
+        ));
         let width16 = u16::try_from(width).map_err(|_| "mode width exceeds the wire format")?;
         let height16 = u16::try_from(height).map_err(|_| "mode height exceeds the wire format")?;
         let refresh16 =
             u16::try_from(refresh_hz).map_err(|_| "refresh rate exceeds the wire format")?;
-        let head_index = usize::from(head);
-        let (video_key, video_nonce) = self
-            .video_key(head_index)
-            .ok_or_else(|| format!("invalid Vino head {head}"))?;
         let padded_width = width.div_ceil(64) * 64;
         let padded_height = height.div_ceil(16) * 16;
-        let prompt = kvino::black_frame_ep08(padded_width, padded_height, head)
-            .map_err(build_error("black training frame"))?;
-        let arm = kvino::video_arm_burst(head, &video_key, &video_nonce, width16, height16)
-            .map_err(build_error("video arm sequence"))?;
-
         let mode = kvino::set_mode_profile(self.inner_counter, head, width16, height16, refresh16)
             .map_err(build_error("mode profile"))?;
         self.send_control(0x48, &mode)?;
@@ -182,12 +560,57 @@ impl ControlSession {
                 late.as_millis()
             ));
         }
+        trace_control(&format!("mode sequence complete head={head}"));
+        Ok(ModeProbeReport {
+            head,
+            width,
+            height,
+            refresh_hz,
+            padded_width,
+            padded_height,
+        })
+    }
+
+    fn run_video_arm_sequence(
+        &mut self,
+        head: u8,
+        width: usize,
+        height: usize,
+        refresh_hz: u32,
+        padded_width: usize,
+        padded_height: usize,
+    ) -> Result<(), String> {
+        trace_control(&format!(
+            "video arm begin head={head} {width}x{height}@{refresh_hz}"
+        ));
+        let width16 = u16::try_from(width).map_err(|_| "mode width exceeds the wire format")?;
+        let height16 = u16::try_from(height).map_err(|_| "mode height exceeds the wire format")?;
+        let head_index = usize::from(head);
+        let (video_key, video_nonce) = self
+            .video_key(head_index)
+            .ok_or_else(|| format!("invalid Vino head {head}"))?;
+        let prompt = kvino::black_frame_ep08(padded_width, padded_height, head)
+            .map_err(build_error("black training frame"))?;
+        let arm = kvino::video_arm_burst(head, &video_key, &video_nonce, width16, height16)
+            .map_err(build_error("video arm sequence"))?;
         let opening = prefix_frame(&arm, &prompt);
+        let anchor = Instant::now();
+
         self.submit_video(head, &opening)?;
-        for _ in 0..2 {
+        trace_control(&format!("video arm opening submitted head={head}"));
+        // This dock multiplexes head-0 video and control on EP 0x02. The opening
+        // URBs complete before firmware is ready to accept the stream commit.
+        std::thread::sleep(VIDEO_ARM_OPEN_SETTLE);
+        for commit_index in 0..2 {
+            trace_control(&format!(
+                "video arm commit head={head} index={commit_index}"
+            ));
             let commit = kvino::stream_commit(self.inner_counter, head)
                 .map_err(build_error("stream commit"))?;
-            self.send_control(0x16, &commit).map(|_| ())?;
+            self.send_control(0x16, &commit)?;
+            if commit_index == 0 {
+                std::thread::sleep(VIDEO_ARM_COMMIT_SETTLE);
+            }
         }
         self.wait_mode_offset(anchor, 123);
         self.send_marker(head, 0x2f, 0)?;
@@ -202,177 +625,20 @@ impl ControlSession {
                 next_status = Instant::now() + Duration::from_millis(16);
             }
         }
+        let _ = refresh_hz;
+        trace_control(&format!("video arm complete head={head}"));
         Ok(())
-    }
-
-    /// Encode and present one padded RGB frame.
-    pub fn present_rgb(
-        &mut self,
-        head: u8,
-        width: usize,
-        height: usize,
-        rgb: &[u8],
-    ) -> Result<(), String> {
-        let head_index = usize::from(head);
-        let sequence = *self
-            .frame_seq
-            .get(head_index)
-            .ok_or_else(|| format!("invalid Vino head {head}"))?;
-        let (frames, next_sequence) =
-            kvino::colour_frame_ep08_head(width, height, rgb, sequence, head)
-                .map_err(build_error("video frame"))?;
-        self.submit_video(head, &frames)?;
-        self.frame_seq[head_index] = next_sequence;
-        self.poll_status()?;
-        Ok(())
-    }
-
-    /// Upload a complete cursor image for one head.
-    pub fn set_cursor(
-        &mut self,
-        head: u8,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<(), String> {
-        let width = u16::try_from(width).map_err(|_| "cursor width exceeds the wire format")?;
-        let height = u16::try_from(height).map_err(|_| "cursor height exceeds the wire format")?;
-        let create = kvino::cursor_create(self.inner_counter, head, width, height)
-            .map_err(build_error("cursor create"))?;
-        self.send_control(0x1b, &create)?;
-        let image = kvino::cursor_image(self.inner_counter, head, width, height, bgra)
-            .map_err(build_error("cursor image"))?;
-        self.send_control(0x1c, &image).map(|_| ())
-    }
-
-    /// Move a previously uploaded cursor.
-    pub fn move_cursor(&mut self, head: u8, x: i32, y: i32) -> Result<(), String> {
-        let x = u16::try_from(x.clamp(0, i32::from(u16::MAX)))
-            .map_err(|_| "cursor x position exceeds the wire format")?;
-        let y = u16::try_from(y.clamp(0, i32::from(u16::MAX)))
-            .map_err(|_| "cursor y position exceeds the wire format")?;
-        let message = kvino::cursor_move(self.inner_counter, head, x, y, true)
-            .map_err(build_error("cursor move"))?;
-        self.send_control(0x1a, &message).map(|_| ())
-    }
-
-    /// Hide a head's cursor by clearing the dock's visible flag.
-    ///
-    /// Parking it off-screen instead leaves a ghost pointer at the top-left of the panel: the dock
-    /// wraps an out-of-range origin rather than clipping the cursor away.
-    pub fn hide_cursor(&mut self, head: u8) -> Result<(), String> {
-        let message = kvino::cursor_move(self.inner_counter, head, 0, 0, false)
-            .map_err(build_error("cursor hide"))?;
-        self.send_control(0x1a, &message).map(|_| ())
-    }
-
-    /// Blank and close a head's active stream.
-    pub fn deactivate_mode(&mut self, head: u8, width: usize, height: usize) -> Result<(), String> {
-        let padded_width = width.div_ceil(64) * 64;
-        let padded_height = height.div_ceil(16) * 16;
-        let black = kvino::black_frame_ep08(padded_width, padded_height, head)
-            .map_err(build_error("black shutdown frame"))?;
-        let deadline = Instant::now() + Duration::from_millis(120);
-        let mut next_status = Instant::now();
-        while Instant::now() < deadline {
-            self.submit_video(head, &black)?;
-            if Instant::now() >= next_status {
-                self.poll_status()?;
-                next_status = Instant::now() + Duration::from_millis(16);
-            }
-        }
-        self.send_marker(head, 0x2f, 0)?;
-        self.send_marker(head, 0x2e, 0)?;
-        self.send_marker(head, 0x2f, 1)?;
-        self.send_marker(head, 0x2e, 1)?;
-        self.poll_status()?;
-        self.send_marker(head, 0x2f, 0)
-    }
-
-    /// Forward one Revdi DDC/CI transaction to a downstream monitor.
-    pub fn ddcci(
-        &mut self,
-        head: u8,
-        address: u16,
-        flags: u16,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        const I2C_M_RD: u16 = 0x0001;
-
-        if address != crate::ddcci::I2C_ADDR {
-            return Err(format!("unsupported DDC/CI address {address:#04x}"));
-        }
-        if flags & I2C_M_RD == 0 {
-            let message = crate::ddcci::forward(self.inner_counter, head, payload)
-                .map_err(build_error("DDC/CI write"))?;
-            self.send_control(0x36, &message)?;
-            return Ok(Vec::new());
-        }
-
-        let message = crate::ddcci::read_request(self.inner_counter, head);
-        let reply = self
-            .send_control(0x15, &message)?
-            .ok_or_else(|| "dock did not return a DDC/CI read reply".to_string())?;
-        crate::ddcci::parse_reply(&self.keys.control_key, &self.keys.control_nonce, &reply)
-            .map_err(build_error("DDC/CI reply"))?
-            .ok_or_else(|| "dock returned an invalid DDC/CI read reply".to_string())
-    }
-
-    fn send_control(&mut self, id: u16, content: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let frame = kvino::seal_interactive(
-            &self.keys.control_key,
-            &self.keys.control_nonce,
-            id,
-            self.wire_seq,
-            content,
-        )
-        .map_err(|e| format!("seal control message {id:#06x}: {e}"))?;
-        self.dock
-            .write_ctrl_raw(&frame)
-            .map_err(|e| format!("send control message {id:#06x}: {e}"))?;
-        self.wire_seq = self
-            .wire_seq
-            .wrapping_add(content.len().div_ceil(16) as u32);
-        self.inner_counter = self.inner_counter.wrapping_add(1);
-        receive_optional(&self.dock, REPLY_TIMEOUT)
-    }
-
-    fn send_marker(&mut self, head: u8, sub: u16, state: u8) -> Result<(), String> {
-        let message = kvino::stream_marker(self.inner_counter, head, sub, state)
-            .map_err(build_error("stream marker"))?;
-        self.send_control(0x16, &message).map(|_| ())
-    }
-
-    fn poll_status(&mut self) -> Result<(), String> {
-        let message = kvino::device_query_req(self.inner_counter, 0x000c)
-            .map_err(build_error("status poll"))?;
-        self.send_control(0x14, &message).map(|_| ())
-    }
-
-    fn wait_mode_offset(&self, anchor: Instant, offset_ms: u64) {
-        wait_until(anchor, Duration::from_millis(offset_ms));
     }
 
     fn submit_video(&self, head: u8, frames: &[Vec<u8>]) -> Result<(), String> {
         let result = match head {
-            0 => self.dock.write_video_frame(&frames),
-            1 => self.dock.write_video2_frame(&frames),
+            0 => self.dock.write_video_frame(frames),
+            1 => self.dock.write_video2_frame(frames),
             _ => return Err(format!("invalid Vino head {head}")),
         };
         result
             .map(|_| ())
             .map_err(|e| format!("submit head {head} video: {e}"))
-    }
-}
-
-/// Run the standalone control-session smoke test.
-pub fn run_coldstart() {
-    match ControlSession::engage() {
-        Ok(_) => println!("Vino control session engaged"),
-        Err(e) => {
-            eprintln!("failed to engage Vino control session: {e}");
-            std::process::exit(1);
-        }
     }
 }
 
@@ -406,7 +672,23 @@ fn session_init(dock: &Dock) -> Result<(), String> {
     Ok(())
 }
 
-fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
+fn expect_hdcp_message(
+    dock: &Dock,
+    expected_id: u8,
+    minimum_payload: usize,
+    label: &'static str,
+) -> Result<Vec<u8>, String> {
+    let (message_id, payload) = receive_hdcp(dock)?;
+    if message_id != expected_id || payload.len() < minimum_payload {
+        return Err(format!(
+            "invalid {label} message {message_id:#04x} ({} bytes)",
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
+fn authenticate(dock: &Dock) -> Result<(SessionKeys, SharedAkeReport), String> {
     use kvino::id;
 
     let mut sequence = 1u32;
@@ -425,13 +707,7 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
     )?;
     sequence += 1;
 
-    let (message_id, certificate_message) = receive_hdcp(dock)?;
-    if message_id != id::AKE_SEND_CERT || certificate_message.len() < 137 {
-        return Err(format!(
-            "invalid AKE_Send_Cert message {message_id:#04x} ({} bytes)",
-            certificate_message.len()
-        ));
-    }
+    let certificate_message = expect_hdcp_message(dock, id::AKE_SEND_CERT, 137, "AKE_Send_Cert")?;
     let repeater = certificate_message[0] != 0;
     let certificate = &certificate_message[1..];
     let mut modulus = [0; 128];
@@ -444,13 +720,12 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
         &kvino::ake_transmitter_info(sequence, 0).map_err(build_error("AKE_Transmitter_Info"))?,
     )?;
     sequence += 1;
-    let _ = receive_hdcp(dock)?;
+    let _receiver_info = expect_hdcp_message(dock, id::AKE_RECEIVER_INFO, 5, "AKE_Receiver_Info")?;
 
     let mut km = [0; 16];
     kvino::rng::fill(&mut km);
-    let mut rsa =
-        kvino::rsa_public_key(&modulus, &exponent).map_err(build_error("RSA public key"))?;
-    let encrypted_km = kvino::oaep_encrypt_km(&mut rsa, &km).map_err(build_error("OAEP"))?;
+    let encrypted_km =
+        kvino::oaep_encrypt_km(&modulus, &exponent, &km).map_err(build_error("OAEP"))?;
     send_plain(
         dock,
         &kvino::ake_no_stored_km(sequence, 0, &encrypted_km)
@@ -458,22 +733,17 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
     )?;
     sequence += 1;
 
-    let (message_id, receiver_random) = receive_hdcp(dock)?;
-    if message_id != id::AKE_SEND_RRX || receiver_random.len() < 8 {
-        return Err(format!("invalid AKE_Send_Rrx message {message_id:#04x}"));
-    }
+    let receiver_random = expect_hdcp_message(dock, id::AKE_SEND_RRX, 8, "AKE_Send_Rrx")?;
     let mut rrx = [0; 8];
     rrx.copy_from_slice(&receiver_random[..8]);
     let kd = kvino::derive_kd(&km, &rtx, &rrx).map_err(build_error("derive kd"))?;
 
-    let (message_id, h_prime) = receive_hdcp(dock)?;
-    if message_id != id::AKE_SEND_H_PRIME
-        || h_prime.len() < 32
-        || kvino::compute_h(&kd, &rtx, repeater)[..] != h_prime[..32]
-    {
+    let h_prime = expect_hdcp_message(dock, id::AKE_SEND_H_PRIME, 32, "AKE_Send_H_Prime")?;
+    if kvino::compute_h(&kd, &rtx, repeater)[..] != h_prime[..32] {
         return Err("receiver H' verification failed".into());
     }
-    let _ = receive_hdcp(dock)?;
+    let _pairing_info =
+        expect_hdcp_message(dock, id::AKE_SEND_PAIRING_INFO, 16, "AKE_Send_Pairing_Info")?;
 
     let mut rn = [0; 8];
     kvino::rng::fill(&mut rn);
@@ -482,11 +752,8 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
         &kvino::lc_init(sequence, 0, &rn).map_err(build_error("LC_Init"))?,
     )?;
     sequence += 1;
-    let (message_id, l_prime) = receive_hdcp(dock)?;
-    if message_id != id::LC_SEND_L_PRIME
-        || l_prime.len() < 32
-        || kvino::compute_l(&kd, &rrx, &rn)[..] != l_prime[..32]
-    {
+    let l_prime = expect_hdcp_message(dock, id::LC_SEND_L_PRIME, 32, "LC_Send_L_Prime")?;
+    if kvino::compute_l(&kd, &rrx, &rn)[..] != l_prime[..32] {
         return Err("receiver L' verification failed".into());
     }
 
@@ -505,12 +772,12 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
 
     let mut receiver_id_list = Vec::new();
     if repeater {
-        let (message_id, list) = receive_hdcp(dock)?;
-        if message_id != id::REPEATERAUTH_SEND_RECEIVERID_LIST || list.len() < 16 {
-            return Err(format!(
-                "invalid RepeaterAuth_ReceiverID_List message {message_id:#04x}"
-            ));
-        }
+        let list = expect_hdcp_message(
+            dock,
+            id::REPEATERAUTH_SEND_RECEIVERID_LIST,
+            16,
+            "RepeaterAuth_ReceiverID_List",
+        )?;
         let split = list.len() - 16;
         let v = kvino::compute_v_full(&kd, &list[..split]);
         if v[..16] != list[split..] {
@@ -533,24 +800,50 @@ fn authenticate(dock: &Dock) -> Result<SessionKeys, String> {
         )?;
         pace_cap_ack(dock, sequence as u16);
         sequence += 1;
-        wait_cap_complete(dock);
+        let (message_id, payload) = receive_hdcp(dock)?;
+        if message_id == id::RECEIVER_AUTH_STATUS {
+            if payload.len() < 3 {
+                return Err(format!(
+                    "invalid Receiver_Auth_Status message {message_id:#04x} ({} bytes)",
+                    payload.len()
+                ));
+            }
+            let _stream_ready = expect_hdcp_message(
+                dock,
+                id::REPEATERAUTH_STREAM_READY,
+                32,
+                "RepeaterAuth_Stream_Ready",
+            )?;
+        } else if message_id != id::REPEATERAUTH_STREAM_READY || payload.len() < 32 {
+            return Err(format!(
+                "invalid RepeaterAuth_Stream_Ready message {message_id:#04x} ({} bytes)",
+                payload.len()
+            ));
+        }
     }
 
     let mut control_nonce = delivered_nonce;
     control_nonce[7] ^= 0x04;
-    Ok(SessionKeys {
-        control_key: kvino::cp_session_key(&raw_session_key),
-        control_nonce,
-        next_counter: sequence as u16,
-        rsa,
-        receiver_id_list,
-    })
+    Ok((
+        SessionKeys {
+            control_key: kvino::cp_session_key(&raw_session_key),
+            control_nonce,
+            next_counter: sequence as u16,
+            modulus,
+            exponent,
+            receiver_id_list: receiver_id_list.clone(),
+        },
+        SharedAkeReport {
+            repeater,
+            receiver_id: certificate[..5]
+                .try_into()
+                .expect("certificate receiver id length already checked"),
+            receiver_id_list_len: receiver_id_list.len(),
+        },
+    ))
 }
 
-fn configure_control(
-    dock: &Dock,
-    keys: &mut SessionKeys,
-) -> Result<(u32, u16, [[u8; 24]; HEADS], usize), String> {
+fn configure_control(dock: &Dock, keys: &SessionKeys) -> Result<ControlConfiguration, String> {
     send_plain(dock, &STREAM_OPEN)?;
     let mut wire_seq = 0u32;
     let mut inner_counter = keys.next_counter;
@@ -592,14 +885,14 @@ fn configure_control(
     }
 
     let mut video_keys = [[0u8; 24]; HEADS];
-    for head in 0..HEADS {
+    for (head, video_key) in video_keys.iter_mut().enumerate() {
         configure_head(
             dock,
             keys,
             head as u8,
             &mut wire_seq,
             &mut inner_counter,
-            &mut video_keys[head],
+            video_key,
             &mut acknowledgements,
         )?;
     }
@@ -627,19 +920,109 @@ fn configure_control(
     dock.vendor_in(0x22, 1, 0, 28)
         .map_err(|e| format!("read encrypted session state: {e}"))?;
     acknowledgements += drain_acknowledgements(dock, 16);
-    Ok((wire_seq, inner_counter, video_keys, acknowledgements))
+    Ok(ControlConfiguration {
+        wire_seq,
+        inner_counter,
+        video_keys,
+        acknowledgements,
+    })
+}
+
+fn run_control_prelude(
+    dock: &Dock,
+    keys: &SessionKeys,
+    wire_seq: &mut u32,
+    inner_counter: &mut u16,
+    acknowledgements: &mut usize,
+) -> Result<(), String> {
+    send_plain(dock, &STREAM_OPEN)?;
+
+    let mut first = [0u8; 32];
+    first[..2].copy_from_slice(&0x0014u16.to_le_bytes());
+    first[4..6].copy_from_slice(&inner_counter.to_le_bytes());
+    kvino::rng::fill(&mut first[22..]);
+    let body_len = first.len() + 16;
+    let mut header = [0u8; 16];
+    header[2..4].copy_from_slice(&((16 + body_len - 4) as u16).to_le_bytes());
+    header[4..8].copy_from_slice(&4u32.to_le_bytes());
+    header[8..10].copy_from_slice(&0x24u16.to_le_bytes());
+    header[10..12].copy_from_slice(&kvino::aux_for_id(0x14, body_len).to_le_bytes());
+    let frame = kvino::seal_livemac(&keys.control_key, &keys.control_nonce, &header, &first)
+        .map_err(build_error("first encrypted control message"))?;
+    send_plain_retry(dock, &frame)?;
+    *acknowledgements += drain_acknowledgements(dock, 8);
+    *inner_counter = inner_counter.wrapping_add(1);
+    *wire_seq += 2;
+
+    for (id, sub, prefix) in [
+        (0x0014u16, 0x0030u16, &[][..]),
+        (0x0015, 0x000b, &[0x01][..]),
+        (0x0016, 0x002a, &[0x00, 0x01][..]),
+        (0x0016, 0x002a, &[0x01, 0x01][..]),
+    ] {
+        let mut content = [0; 32];
+        content[..2].copy_from_slice(&id.to_le_bytes());
+        content[2..4].copy_from_slice(&sub.to_le_bytes());
+        content[4..6].copy_from_slice(&inner_counter.to_le_bytes());
+        kvino::rng::fill(&mut content[22..]);
+        content[22..22 + prefix.len()].copy_from_slice(prefix);
+        send_interactive(dock, keys, id, *wire_seq, &content)?;
+        *acknowledgements += drain_acknowledgements(dock, 2);
+        *inner_counter = inner_counter.wrapping_add(1);
+        *wire_seq += 2;
+    }
+    Ok(())
+}
+
+pub fn probe_per_head(head: u8) -> Result<PerHeadReport, String> {
+    if usize::from(head) >= HEADS {
+        return Err(format!("invalid Vino head {head}"));
+    }
+    let dock = Dock::open().map_err(|e| format!("open DisplayLink dock: {e}"))?;
+    device_open_preamble(&dock)?;
+    session_init(&dock)?;
+    let (keys, _) = authenticate(&dock)?;
+    let mut wire_seq = 0u32;
+    let mut inner_counter = keys.next_counter;
+    let mut acknowledgements = 0usize;
+    let mut video_key = [0u8; 24];
+
+    run_control_prelude(
+        &dock,
+        &keys,
+        &mut wire_seq,
+        &mut inner_counter,
+        &mut acknowledgements,
+    )?;
+    let rrx = configure_head(
+        &dock,
+        &keys,
+        head,
+        &mut wire_seq,
+        &mut inner_counter,
+        &mut video_key,
+        &mut acknowledgements,
+    )?;
+
+    Ok(PerHeadReport {
+        head,
+        rrx,
+        acknowledgements,
+        final_inner_counter: inner_counter,
+        final_wire_sequence: wire_seq,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn configure_head(
     dock: &Dock,
-    keys: &mut SessionKeys,
+    keys: &SessionKeys,
     head: u8,
     wire_seq: &mut u32,
     inner_counter: &mut u16,
     video_key: &mut [u8; 24],
     acknowledgements: &mut usize,
-) -> Result<(), String> {
+) -> Result<[u8; 8], String> {
     let mut rtx = [0; 8];
     let mut km = [0; 16];
     let mut rn = [0; 8];
@@ -650,9 +1033,9 @@ fn configure_head(
     kvino::rng::fill(&mut rn);
     kvino::rng::fill(&mut raw_video_key);
     kvino::rng::fill(&mut delivered_nonce);
-    let encrypted_km = kvino::oaep_encrypt_km(&mut keys.rsa, &km).map_err(build_error("OAEP"))?;
-    let whitened_video_key = kvino::cp_session_key(&raw_video_key);
-    video_key[..16].copy_from_slice(&whitened_video_key[..]);
+    let encrypted_km =
+        kvino::oaep_encrypt_km(&keys.modulus, &keys.exponent, &km).map_err(build_error("OAEP"))?;
+    video_key[..16].copy_from_slice(&kvino::cp_session_key(&raw_video_key));
     video_key[16..].copy_from_slice(&kvino::video_content_nonce(&delivered_nonce, head));
 
     let mut receiver_random = None;
@@ -660,7 +1043,8 @@ fn configure_head(
     let mut v_ack = None;
     for (index, (id, sub, content_len)) in kvino::CP_SETUP_PER_HEAD.into_iter().enumerate() {
         if index >= 3 && encrypted_session_key.is_none() {
-            let rrx = receiver_random.ok_or("downstream receiver did not provide Rrx")?;
+            let rrx = receiver_random
+                .ok_or_else(|| format!("head {head} downstream receiver did not provide Rrx"))?;
             let kd = kvino::derive_kd(&km, &rtx, &rrx).map_err(build_error("derive head kd"))?;
             encrypted_session_key = Some(
                 kvino::compute_eks(&km, &rtx, &rrx, &rn, &raw_video_key)
@@ -761,12 +1145,12 @@ fn configure_head(
         *inner_counter = inner_counter.wrapping_add(1);
         *wire_seq = wire_seq.wrapping_add(content.len().div_ceil(16) as u32);
     }
-    if encrypted_session_key.is_none() || v_ack.is_none() {
+    if encrypted_session_key.is_none() || v_ack.is_none() || receiver_random.is_none() {
         return Err(format!(
             "downstream head {head} authentication did not complete"
         ));
     }
-    Ok(())
+    Ok(receiver_random.expect("checked above"))
 }
 
 fn send_interactive(
@@ -841,33 +1225,6 @@ fn pace_cap_ack(dock: &Dock, wanted_counter: u16) {
     }
 }
 
-fn wait_cap_complete(dock: &Dock) {
-    let mut saw_capability_end = false;
-    let mut saw_stream_ready = false;
-    let mut quiet = 0;
-    for _ in 0..48 {
-        match dock.recv_frame_raw_timeout(16_384, Duration::from_millis(5)) {
-            Ok(reply) if reply.len() >= 20 => {
-                quiet = 0;
-                saw_capability_end |= u16::from_le_bytes([reply[16], reply[17]]) == 0x0b
-                    && u16::from_le_bytes([reply[18], reply[19]]) == 0x84;
-                saw_stream_ready |=
-                    reply.len() >= 58 && reply[25] == kvino::id::REPEATERAUTH_STREAM_READY;
-                if saw_capability_end && saw_stream_ready {
-                    return;
-                }
-            }
-            _ if saw_capability_end || saw_stream_ready => {
-                quiet += 1;
-                if quiet == 3 {
-                    return;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn receive_optional(dock: &Dock, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
     match dock.recv_frame_raw_timeout(4096, timeout) {
         Ok(reply) => Ok(Some(reply)),
@@ -910,4 +1267,22 @@ fn prefix_frame(prefix: &[u8], frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
         stream.extend_from_slice(frame);
     }
     stream.chunks(TRANSFER_SIZE).map(<[u8]>::to_vec).collect()
+}
+
+fn pad_rgb(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
+    let padded_width = width.div_ceil(64) * 64;
+    let padded_height = height.div_ceil(16) * 16;
+    if padded_width == width && padded_height == height {
+        return (rgb.to_vec(), width, height);
+    }
+    let mut padded = vec![0; padded_width * padded_height * 3];
+    let source_stride = width * 3;
+    let target_stride = padded_width * 3;
+    for row in 0..height {
+        let source = row * source_stride;
+        let target = row * target_stride;
+        padded[target..target + source_stride]
+            .copy_from_slice(&rgb[source..source + source_stride]);
+    }
+    (padded, padded_width, padded_height)
 }

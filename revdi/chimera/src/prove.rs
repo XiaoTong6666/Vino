@@ -262,26 +262,20 @@ pub fn run() -> Report {
 
         // Cursor create/move/image. Layout recovered byte-exact by the cp-seal
         // differential; create/move leak uninitialised padding at off28..31.
-        if matches!(sub, 0x41 | 0x42 | 0x43) {
-            // off22 carries the dock's head id, counted from ONE; off23 is the cursor's visible
-            // flag, set on move and clear on the bitmap-bearing messages. Reading off23 as the head
-            // (as this did) happened to round-trip only because the flag and head id share values.
-            let head = content[22].saturating_sub(1);
-            let visible = content[23] != 0;
+        if matches!(sub, 0x41..=0x43) {
+            let head = content[23];
             let f1 = le16(content, 24);
             let f2 = le16(content, 26);
             let mine = match sub {
                 0x42 => kvino::cursor_create(ctr, head, f1, f2),
-                0x43 => kvino::cursor_move(ctr, head, f1, f2, visible),
+                0x43 => kvino::cursor_move(ctr, head, f1, f2),
                 _ => {
-                    // image: off32..33 are zero and the bitmap starts at off34, with the final
-                    // pixel truncated by two bytes so the message stays 32 + w*h*4. Rebuild the
-                    // builder's input by restoring those two bytes; feeding from off32 shifts the
-                    // whole bitmap and only diverges at the first non-transparent pixel.
-                    let mut bgra = content[34..].to_vec();
-                    bgra.extend_from_slice(&[0, 0]);
+                    // image: the bitmap is everything past off32; w*h*4 must equal
+                    // its length, so feed any matching (w,h) (the builder only uses
+                    // them to validate; the inner carries no w/h here).
+                    let bgra = &content[32..];
                     let w = (bgra.len() / 4) as u16;
-                    kvino::cursor_image(ctr, head, w, 1, &bgra)
+                    kvino::cursor_image(ctr, head, w, 1, bgra)
                 }
             }
             .expect("cursor");
@@ -369,7 +363,8 @@ pub fn run() -> Report {
     }
     // Colour transform DC vs DLM's encoder-IO ground truth (the 9 measured
     // colours from validate-transform-encoderio.py): (R,G,B) -> (Y,Cb,Cr) DC.
-    const COLOUR_GT: &[((u8, u8, u8), (i32, i32, i32))] = &[
+    type ColourGroundTruth = ((u8, u8, u8), (i32, i32, i32));
+    const COLOUR_GT: &[ColourGroundTruth] = &[
         ((0, 0, 0), (0, 0, 0)),
         ((128, 128, 128), (8192, 0, 0)),
         ((255, 255, 255), (16320, 0, 0)),
@@ -461,10 +456,10 @@ pub fn run() -> Report {
         let y = nums[1] as u16;
         let mut planes = [[[0i32; 64]; 3]; 16];
         let mut idx = 2;
-        for k in 0..16 {
-            for p in 0..3 {
-                for i in 0..64 {
-                    planes[k][p][i] = nums[idx];
+        for block in &mut planes {
+            for plane in block {
+                for coefficient in plane {
+                    *coefficient = nums[idx];
                     idx += 1;
                 }
             }
@@ -517,7 +512,7 @@ pub fn run() -> Report {
         for rx in 0..sx {
             let (ox, oy) = (rx * 64, ry * 16);
             let mut planes = [[[0i32; 64]; 3]; 16];
-            for k in 0..16 {
+            for (k, block) in planes.iter_mut().enumerate() {
                 let (bx, by) = (k % 8, k / 8);
                 for r in 0..8 {
                     for c in 0..8 {
@@ -526,14 +521,15 @@ pub fn run() -> Report {
                         let (yv, cbv, crv) =
                             crate::kvino::colour(rgb[idx], rgb[idx + 1], rgb[idx + 2]);
                         let i = r * 8 + c;
-                        planes[k][0][i] = crv;
-                        planes[k][1][i] = cbv;
-                        planes[k][2][i] = yv;
+                        block[0][i] = crv;
+                        block[1][i] = cbv;
+                        block[2][i] = yv;
                     }
                 }
             }
-            standalone
-                .push(crate::kvino::colour_strip_blocks(&planes, ox as u16, oy as u16).unwrap());
+            standalone.push(
+                crate::kvino::colour_strip_from_planes(&planes, ox as u16, oy as u16).unwrap(),
+            );
         }
     }
     let mut frame_ok = true;
@@ -570,7 +566,11 @@ pub fn run() -> Report {
             stream[off + 14],
             stream[off + 15],
         ]);
-        if pad != 0 || ty != 4 || off + size + 4 > stream.len() || fseq != 0 || (size + 4) % 16 != 0
+        if pad != 0
+            || ty != 4
+            || off + size + 4 > stream.len()
+            || fseq != 0
+            || !(size + 4).is_multiple_of(16)
         {
             frame_ok = false;
             println!(
@@ -696,18 +696,17 @@ mod tests {
         );
     }
 
-    /// **Chimera-first EDID-wait proof (2026-07-17).** Before this landed in `vino.ko`, prove
-    /// against the literal kernel `cp.rs` (via `kvino`) that `edid_poll_ready` correctly reads
-    /// the dock's downstream-DDC readiness bit from two REAL `id=0x0044 sub=0x0020` probe
-    /// replies (wire seq 205/857 in
+    /// **Chimera-first EDID-status proof (2026-07-17).** Prove against the literal kernel `cp.rs`
+    /// (via `kvino`) that two REAL `id=0x0044 sub=0x0020` replies expose the native DLM status
+    /// layout: presence at offset 24, `EDIDAvailable` at bit 2, and little-endian EDID length at
+    /// offsets 26..27 (wire seq 205/857 in
     /// `captures/rr-out-sequence-20260716/full-session-trace1/raw-out-in-192msg.txt`) -- the
     /// first is DLM's own probe right before its FIRST placeholder `id=0x114` fetch, the second
-    /// is the probe right before its FIRST real `id=0x194` fetch. Also proves the new
-    /// `edid_engage_req`/`device_query_req(.., 0x0c)` builders produce the documented 32-byte
-    /// shape. Userspace-testable without a kernel rebuild -- exactly the "prove in chimera
-    /// before vino" workflow this file exists for.
+    /// is the probe right before its FIRST real `id=0x194` fetch. The transition is 256-byte
+    /// placeholder to 384-byte real EDID, not a false `0x80` readiness bit. Also retains the
+    /// capture-derived builder shape checks.
     #[test]
-    fn edid_poll_ready_and_new_builders() {
+    fn edid_status_and_capture_derived_builders() {
         const KS: [u8; 16] = [
             0xd9, 0xec, 0x1f, 0xbc, 0x8b, 0x5a, 0xb3, 0xd8, 0x71, 0x0f, 0xd3, 0xbd, 0x42, 0x04,
             0x06, 0x55,
@@ -736,10 +735,13 @@ mod tests {
             0xb2, 0x83, 0x89, 0x62, 0x4b, 0xcb, 0x59, 0x15, 0x1f, 0x8f, 0x85, 0xc3, 0xa5, 0x9d,
         ];
         assert_eq!(
-            kvino::edid_poll_ready(&KS, &OUT_RIV, &NOT_READY),
-            Some(false)
+            kvino::parse_edid_status(&KS, &OUT_RIV, &NOT_READY),
+            Some((3, true, 256))
         );
-        assert_eq!(kvino::edid_poll_ready(&KS, &OUT_RIV, &READY), Some(true));
+        assert_eq!(
+            kvino::parse_edid_status(&KS, &OUT_RIV, &READY),
+            Some((3, true, 384))
+        );
 
         let engage = kvino::edid_engage_req(0x30, 0).unwrap();
         assert_eq!(engage.len(), 32);

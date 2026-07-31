@@ -19,12 +19,12 @@ pub(super) const CP_KEY_WHITEN: [u8; 16] = [
 /// The result of `ske_ks XOR `[`CP_KEY_WHITEN`] keys the AES-CTR content
 /// cipher and the Dl3Cmac in [`seal_livemac`]. The input is wrapped into
 /// `Edkey`; the dock applies the same XOR.
-pub(super) fn cp_session_key(ske_ks: &[u8; 16]) -> kernel::crypto::Secret<16> {
+pub(super) fn cp_session_key(ske_ks: &[u8; 16]) -> [u8; 16] {
     let mut key = *ske_ks;
     for i in 0..16 {
         key[i] ^= CP_KEY_WHITEN[i];
     }
-    kernel::crypto::Secret::new(key)
+    key
 }
 
 /// Derive the AES-CTR content nonce for one video head from the RIV carried by that head's
@@ -180,113 +180,49 @@ pub(super) struct Timing {
     pub refresh_hz: u16,
     /// Pixel clock in 10 kHz units, serialized at offset 70.
     pub pixel_clock_10khz: u16,
-    /// Link configuration word at offset 42, selected by [`mode_profile`].
+    /// Link configuration word at offset 42, selected by [`mode_words`].
     pub field42: u16,
-    /// Mode-dependent word at offset 66, selected by [`mode_profile`].
+    /// Undecoded mode-dependent word at offset 66, selected by [`mode_words`].
     pub off66: u16,
-}
-
-/// Select the offset-42 downstream link word from the mode's width.
-///
-/// The field is resolution-keyed, not bandwidth-keyed: 2560x1440p60 runs at 241.50 MHz and carries
-/// `0x0600`, while 1920x1080p120 runs *faster* at 297.00 MHz and carries `0x0400`. That rules out
-/// reading it as a DP link-bandwidth tier, which `docs/VIDEO.md` had suggested and which would put
-/// both of those modes inside 4-lane HBR.
-///
-/// Measured: 1920x1080 at 60 and 120 Hz -> `0x0400`; 2560x1440 at 60 and 120 Hz -> `0x0600`.
-/// The 1280x720p60 and 3840x2160p60 values predate the decrypted corpus but fall on the same
-/// ladder.
-///
-/// ⚠ `vdisplay` tracks `hdisplay` in every sample, so nothing distinguishes a width ladder from
-/// an area one; width is chosen because the steps land on standard widths.
-fn link_word_42(hdisplay: u16) -> u16 {
-    match hdisplay {
-        0..=1920 => 0x0400,
-        1921..=2560 => 0x0600,
-        _ => 0x0604,
-    }
-}
-
-/// Select the offset-66 mode word: a base in the high byte, the mode's CTA VIC in the low byte.
-///
-/// The low byte is the VIC, or zero for a timing that has none. Measured: `0x10` for 1920x1080p60
-/// (VIC 16), `0x3f` for 1920x1080p120 (VIC 63), `0x00` for the VIC-less 2560x1440p60 and p120
-/// CVT-RB timings.
-///
-/// The base is `0x2800` only for a mode that both has a VIC *and* runs at 60 Hz or below; every
-/// other measured message uses `0x0800`. That is what separates 1920x1080p60 (`0x2810`) from
-/// 2560x1440p60 (`0x0800`) -- same refresh, but the 1440p timing is CVT-RB and carries no VIC, so
-/// refresh alone does not select the base.
-///
-/// ⚠ `0x2800` is observed in exactly one message and its meaning is undecoded, so treat any mode
-/// that lands on it without a measurement as suspect first if a panel stays dark.
-fn mode_word_66(mode: &kernel::drm::kms::modes::DisplayMode, refresh: u16) -> u16 {
-    let vic = u16::from(mode.cea_vic()) & 0x00ff;
-    let base: u16 = if vic != 0 && refresh <= 60 {
-        0x2800
-    } else {
-        0x0800
-    };
-    base | vic
-}
-
-/// A mode's offset-42 and offset-66 set-mode words, and how they were obtained.
-pub(super) struct ModeProfile {
-    pub off42: u16,
-    pub off66: u16,
-    /// True when these bytes are reproduced from a decrypted DLM set-mode message.
-    pub measured: bool,
 }
 
 /// Return the two mode-dependent set-mode words at offsets 42 and 66.
 ///
-/// Modes that appear in a decrypted DLM message are reproduced byte-exactly. Everything else is
-/// derived by [`link_word_42`] and [`mode_word_66`], which between them reproduce every measured
-/// message, so the dock's vocabulary is no longer limited to the handful of timings that happen to
-/// have been captured. The envelope DLM itself stays inside -- refresh ceiling, per-head clock and
-/// the shared pixel budget -- is enforced by `drm_sink`'s `mode_valid`, not here.
-pub(super) fn mode_profile(mode: &kernel::drm::kms::modes::DisplayMode) -> Option<ModeProfile> {
-    let clock = mode.clock();
-    if clock <= 0 {
-        return None;
+/// These values are part of the dock's mode profile rather than ordinary display timing fields.
+/// Accept only byte-exact vendor vectors. The CTA modes use DRM's canonical VIC matcher; the
+/// remaining CVT-RB timings are matched in full.
+fn mode_words(mode: &kernel::drm::kms::modes::DisplayMode) -> Option<(u16, u16)> {
+    match mode.cea_vic() {
+        4 => return Some((0x0400, 0x2804)),  // 1280x720p60
+        16 => return Some((0x0400, 0x2810)), // 1920x1080p60
+        63 => return Some((0x0400, 0x083f)), // 1920x1080p120
+        _ => {}
     }
-    let refresh = mode.vrefresh();
-    if refresh <= 0 {
-        return None;
-    }
-    let refresh = refresh as u16;
 
-    let measured = matches!(
-        (
-            clock,
-            mode.hdisplay(),
-            mode.hsync_start(),
-            mode.hsync_end(),
-            mode.htotal(),
-            mode.vdisplay(),
-            mode.vsync_start(),
-            mode.vsync_end(),
-            mode.vtotal(),
-        ),
-        // The whole decrypted DLM corpus: 1920x1080p60 and p120 (CTA), 2560x1440p60 and p120
-        // (CVT-RB). The derivation reproduces all four byte-exactly, so these need no override --
-        // the match only records that the bytes are backed by a capture.
-        (148_500, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125)
-            | (297_000, 1920, 2008, 2052, 2200, 1080, 1084, 1089, 1125)
-            | (241_500, 2560, 2608, 2640, 2720, 1440, 1443, 1448, 1481)
-            | (497_750, 2560, 2608, 2640, 2720, 1440, 1443, 1448, 1525)
+    let timing = (
+        mode.clock(),
+        mode.hdisplay(),
+        mode.hsync_start(),
+        mode.hsync_end(),
+        mode.htotal(),
+        mode.vdisplay(),
+        mode.vsync_start(),
+        mode.vsync_end(),
+        mode.vtotal(),
     );
-
-    Some(ModeProfile {
-        off42: link_word_42(mode.hdisplay()),
-        off66: mode_word_66(mode, refresh),
-        measured,
-    })
+    match timing {
+        // 2560x1440@60 and @120 CVT-RB, both captured from DLM 3.4.26.
+        (241_500, 2560, 2608, 2640, 2720, 1440, 1443, 1448, 1481)
+        | (497_750, 2560, 2608, 2640, 2720, 1440, 1443, 1448, 1525) => Some((0x0600, 0x0800)),
+        // 3840x2160@60 CVT-RB vendor vector.
+        (533_120, 3840, 3888, 3920, 4000, 2160, 2163, 2168, 2222) => Some((0x0604, 0x0800)),
+        _ => None,
+    }
 }
 
-/// Whether the dock can be given a mode profile for `mode`.
+/// Whether the dock has a captured mode profile for `mode`.
 pub(super) fn mode_supported(mode: &kernel::drm::kms::modes::DisplayMode) -> bool {
-    mode_profile(mode).is_some()
+    mode_words(mode).is_some()
 }
 
 /// Set-mode (`id=0x48 sub=0x22`): an 80-byte inner message carrying the target head and a
@@ -317,11 +253,11 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
         b.extend_from_slice(&v.to_le_bytes(), GFP_KERNEL)?;
     }
     pad_to(&mut b, 58)?;
-    b.extend_from_slice(&0x0080u16.to_le_bytes(), GFP_KERNEL)?; // off58: profile constant
-    b.extend_from_slice(&0x00ffu16.to_le_bytes(), GFP_KERNEL)?; // off60: profile constant
+    b.extend_from_slice(&0x0080u16.to_le_bytes(), GFP_KERNEL)?; // off58 (observed const)
+    b.extend_from_slice(&0x00ffu16.to_le_bytes(), GFP_KERNEL)?; // off60 (observed const)
     pad_to(&mut b, 66)?;
-    b.extend_from_slice(&t.off66.to_le_bytes(), GFP_KERNEL)?; // off66: see `mode_profile`
-    b.extend_from_slice(&0x0200u16.to_le_bytes(), GFP_KERNEL)?; // off68: profile constant
+    b.extend_from_slice(&t.off66.to_le_bytes(), GFP_KERNEL)?; // off66: see `mode_words`
+    b.extend_from_slice(&0x0200u16.to_le_bytes(), GFP_KERNEL)?; // off68: DLM 3.4.26 constant
     b.extend_from_slice(&t.pixel_clock_10khz.to_le_bytes(), GFP_KERNEL)?; // off70: 10 kHz units
     pad_to(&mut b, 74)?;
     let mut tail = [0u8; 6];
@@ -329,26 +265,122 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     b.extend_from_slice(&tail, GFP_KERNEL)?; // off74..79: fresh per-message token
     Ok(b)
 }
+/// VESA MCCS 2.2 VCP feature codes carried over DDC/CI.
+pub(super) const VCP_BRIGHTNESS: u8 = 0x10;
+pub(super) const VCP_CONTRAST: u8 = 0x12;
+/// VCP 0xD6 "Power mode": value 0x01 = on, 0x04 = off (DPMS-off / hard standby). Lets DPMS
+/// blank the panel backlight instead of freezing the last frame (see [`crtc_atomic_disable`]).
+pub(super) const VCP_POWER_MODE: u8 = 0xd6;
+pub(super) const POWER_OFF: u16 = 0x04;
+/// Build a DDC/CI "Set VCP Feature" request: the 7 bytes a DDC/CI host writes to the
+/// monitor's I2C slave 0x37, after the 0x6e (= 0x37<<1) write address (VESA DDC/CI 1.1
+/// sec 4.4). Layout: source 0x51, length `0x80 | 4`, opcode 0x03 (Set VCP), VCP code,
+/// value-hi, value-lo, then an XOR checksum seeded with the destination address 0x6e. Pure
+/// and fully standard, so it is unit-tested byte-exact against the spec
+/// ([`super::tests::ddc_ci_set_vcp_checksum`]).
+pub(super) fn ddc_ci_set_vcp(vcp: u8, value: u16) -> [u8; 7] {
+    let body = [0x51u8, 0x84, 0x03, vcp, (value >> 8) as u8, value as u8];
+    let mut chk = 0x6eu8; // checksum seed = destination slave-write address (0x37 << 1)
+    for &x in &body {
+        chk ^= x;
+    }
+    [body[0], body[1], body[2], body[3], body[4], body[5], chk]
+}
+/// CP message that tunnels a DDC/CI Set-VCP write to one downstream monitor.
+pub(super) fn ddc_set_vcp(counter: u16, head: u8, vcp: u8, value: u16) -> Result<KVec<u8>> {
+    ddc_forward(counter, head, &ddc_ci_set_vcp(vcp, value))
+}
+/// The DDC/CI I2C slave address on the monitor bus.
+pub(super) const DDCCI_I2C_ADDR: u8 = 0x37;
+/// Tunnel a raw DDC/CI write to `head`.
+///
+/// Offset 22 selects the head, offset 23 contains the payload length, offsets 24 through 55 contain
+/// the DDC bytes and zero padding, and offsets 56 through 63 contain a fresh token. The monitor's
+/// I2C address is implicit.
+pub(super) fn ddc_forward(counter: u16, head: u8, payload: &[u8]) -> Result<KVec<u8>> {
+    if payload.len() > 32 {
+        return Err(EINVAL);
+    }
+    let mut b = KVec::with_capacity(64, GFP_KERNEL)?;
+    header(&mut b, 0x36, 0x26, counter)?;
+    pad_to(&mut b, 22)?;
+    b.push(head, GFP_KERNEL)?;
+    b.push(payload.len() as u8, GFP_KERNEL)?;
+    b.extend_from_slice(payload, GFP_KERNEL)?;
+    pad_to(&mut b, 56)?;
+    let mut tail = [0u8; 8];
+    rng::fill(&mut tail);
+    b.extend_from_slice(&tail, GFP_KERNEL)?;
+    Ok(b)
+}
+
+/// Request the result of the preceding DDC/CI read command for `head`. DLM sends this 32-byte
+/// `id=0x15 sub=0x25` message after forwarding a Get-VCP write; the dock responds with
+/// `id=0x20 sub=0x25`, response length at inner off22 and raw DDC bytes at off23.
+pub(super) fn ddc_read_req(counter: u16, head: u8) -> Result<KVec<u8>> {
+    let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
+    header(&mut b, 0x15, 0x25, counter)?;
+    pad_to(&mut b, 22)?;
+    b.push(head, GFP_KERNEL)?;
+    let mut tail = [0u8; 9];
+    rng::fill(&mut tail);
+    b.extend_from_slice(&tail, GFP_KERNEL)?;
+    Ok(b)
+}
+
+/// Decode the `id=0x20 sub=0x25` reply to [`ddc_read_req`].
+///
+/// The response length is at inner offset 22 and the DDC/CI bytes begin at offset 23. Firmware
+/// uses the same four inbound RIV variants as the other interactive replies, so accept only a
+/// message whose complete inner header and declared payload validate under one of them.
+pub(super) fn parse_ddc_reply(
+    ks: &[u8; 16],
+    out_riv: &[u8; 8],
+    wire: &[u8],
+) -> Result<Option<KVec<u8>>> {
+    if wire.len() < 32
+        || u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]) != 4
+        || u16::from_le_bytes([wire[8], wire[9]]) != 0x45
+    {
+        return Ok(None);
+    }
+    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
+    let encrypted = &wire[16..wire.len() - 16];
+    for riv in inbound_reply_rivs(out_riv) {
+        let Ok(plaintext) = open_in(ks, &riv, seq, encrypted) else {
+            continue;
+        };
+        if plaintext.len() < 23 {
+            continue;
+        }
+        let id = u16::from_le_bytes([plaintext[0], plaintext[1]]);
+        let sub = u16::from_le_bytes([plaintext[2], plaintext[3]]);
+        let pad = u16::from_le_bytes([plaintext[6], plaintext[7]]);
+        if id != 0x20 || sub != 0x25 || pad != 0 {
+            continue;
+        }
+        let len = plaintext[22] as usize;
+        let Some(end) = 23usize.checked_add(len) else {
+            return Err(EPROTO);
+        };
+        let Some(payload) = plaintext.get(23..end) else {
+            return Err(EPROTO);
+        };
+        let mut out = KVec::with_capacity(len, GFP_KERNEL)?;
+        out.extend_from_slice(payload, GFP_KERNEL)?;
+        return Ok(Some(out));
+    }
+    Ok(None)
+}
+
 /// Convert a DRM display mode into the dock's set-mode timing representation.
 pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) -> Result<Timing> {
     let refresh = mode.vrefresh() as u16;
     let sub = |a: u16, b: u16| a.saturating_sub(b);
-    let profile = mode_profile(mode).ok_or(EINVAL)?;
+    let (field42, off66) = mode_words(mode).ok_or(EINVAL)?;
     let clock = mode.clock();
     if clock <= 0 {
         return Err(EINVAL);
-    }
-    // A dark panel on a mode with no decrypted message is far more likely to be these two words
-    // than anything else in the pipeline, so name them in the log.
-    if !profile.measured {
-        pr_info!(
-            "vino: {}x{}@{} has no decrypted DLM profile; inferring off42={:#06x} off66={:#06x}\n",
-            mode.hdisplay(),
-            mode.vdisplay(),
-            refresh,
-            profile.off42,
-            profile.off66
-        );
     }
     let pixel_clock_10khz = u16::try_from((clock as u32) / 10).map_err(|_| EINVAL)?;
     Ok(Timing {
@@ -362,8 +394,8 @@ pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) 
         vsync_width: sub(mode.vsync_end(), mode.vsync_start()),
         refresh_hz: refresh,
         pixel_clock_10khz,
-        field42: profile.off42,
-        off66: profile.off66,
+        field42,
+        off66,
     })
 }
 /// Known CP `sub` identifiers used to validate a decrypted header.
@@ -566,70 +598,35 @@ pub(super) fn perhead_rrx(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Opti
 // off26..27 field2 LE u16 (create: height / move: Y / image: 0)
 // off28..31 zero
 // Cursor images append their w*h*4 BGRA bitmap at off32 and set the high-byte flag in id 0x401c.
-/// The dock's head id at off22 of every cursor message, indexed by vino's head number.
-///
-/// Cursor wire layout (sec 8.6.1). All three messages share the 32-byte inner header built by
-/// [`cursor_header`], with the head selector at off22 and a flag at off23.
-///
-/// The dock numbers its heads from **one**; `0` is not a valid selector.
-const CURSOR_HEAD_IDS: [u8; 2] = [0x01, 0x02];
-
-/// off23 is the cursor's **visible** flag, not a message-kind tag: set to show the cursor, clear to
-/// hide it. The bitmap-bearing messages carry it clear because an upload is not itself a show.
-const CURSOR_OFF23_VISIBLE: u8 = 0x01;
-const CURSOR_OFF23_HIDDEN: u8 = 0x00;
-
-fn cursor_header(
-    b: &mut KVec<u8>,
-    id: u16,
-    sub: u16,
-    counter: u16,
-    off22: u8,
-    off23: u8,
-) -> Result {
+fn cursor_header(b: &mut KVec<u8>, id: u16, sub: u16, counter: u16, head: u8) -> Result {
     header(b, id, sub, counter)?;
     pad_to(b, 22)?;
-    b.push(off22, GFP_KERNEL)?;
-    b.push(off23, GFP_KERNEL)?;
+    b.push(0x02, GFP_KERNEL)?; // off22 marker
+    b.push(head, GFP_KERNEL)?; // off23 head id
     Ok(())
 }
-
-/// cursor create: `id=0x1b sub=0x42`, advertises `w x h`. Sent once per bitmap geometry.
+/// cursor create (sec 8.6.1): `id=0x1b sub=0x42`, advertises `w x h` for `head`.
 pub(super) fn cursor_create(counter: u16, head: u8, w: u16, h: u16) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
-    cursor_header(&mut b, 0x1b, 0x42, counter, dock_head, CURSOR_OFF23_HIDDEN)?;
+    cursor_header(&mut b, 0x1b, 0x42, counter, head)?;
     b.extend_from_slice(&w.to_le_bytes(), GFP_KERNEL)?; // off24..25
     b.extend_from_slice(&h.to_le_bytes(), GFP_KERNEL)?; // off26..27
-    pad_to(&mut b, 32)?; // off28..31 reserved
+    pad_to(&mut b, 32)?; // off28..31 (DLM uninit; we zero)
     Ok(b)
 }
-/// cursor move: `id=0x1a sub=0x43`, X at off24 and Y at off26 (LE), for one head.
-pub(super) fn cursor_move(
-    counter: u16,
-    head: u8,
-    x: u16,
-    y: u16,
-    visible: bool,
-) -> Result<KVec<u8>> {
+/// cursor move (sec 8.6.1): `id=0x1a sub=0x43`, head id @23, X @24, Y @26 (LE).
+pub(super) fn cursor_move(counter: u16, head: u8, x: u16, y: u16) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
-    let off23 = if visible {
-        CURSOR_OFF23_VISIBLE
-    } else {
-        CURSOR_OFF23_HIDDEN
-    };
-    cursor_header(&mut b, 0x1a, 0x43, counter, dock_head, off23)?;
+    cursor_header(&mut b, 0x1a, 0x43, counter, head)?;
     b.extend_from_slice(&x.to_le_bytes(), GFP_KERNEL)?; // off24..25
     b.extend_from_slice(&y.to_le_bytes(), GFP_KERNEL)?; // off26..27
-    pad_to(&mut b, 32)?; // off28..31 reserved
+    pad_to(&mut b, 32)?; // off28..31 (DLM uninit; we zero)
     Ok(b)
 }
-/// cursor image: inner `id=0x401c sub=0x41` (the `0x40` high-byte flag marks the bitmap-bearing
-/// message), a 32-byte header then the bitmap. `w`/`h` come from [`cursor_create`].
-///
-/// Pixels are DRM `ARGB8888` (`[B, G, R, A]`, premultiplied) and **start at off34**: off32..33 are
-/// zero and the final pixel is truncated, so the message stays `32 + w*h*4` bytes.
+/// cursor image (sec 8.6.1): inner `id=0x401c sub=0x41` (the 0x40 high-byte flag marks the
+/// bitmap-bearing message). A 32-byte header (shared marker + head, no w/h -- those come from
+/// [`cursor_create`]) followed by the `w*h*4` BGRA bitmap at off32. `bgra` must be `w*h*4` bytes
+/// -- DRM hands the driver a 64x64 ARGB8888 cursor buffer and the caller swaps it to BGRA.
 pub(super) fn cursor_image(
     counter: u16,
     head: u8,
@@ -647,11 +644,9 @@ pub(super) fn cursor_image(
         return Err(EINVAL);
     }
     let mut b = KVec::with_capacity(32 + bgra.len(), GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
-    cursor_header(&mut b, 0x401c, 0x41, counter, dock_head, CURSOR_OFF23_HIDDEN)?;
+    cursor_header(&mut b, 0x401c, 0x41, counter, head)?;
     pad_to(&mut b, 32)?; // off24..31 zero (no w/h here)
-    b.extend_from_slice(&[0, 0], GFP_KERNEL)?; // off32..33
-    b.extend_from_slice(&bgra[..bgra.len() - 2], GFP_KERNEL)?; // pixels @ off34
+    b.extend_from_slice(bgra, GFP_KERNEL)?; // bitmap @ off32
     Ok(b)
 }
 /// Compute the 16-byte DisplayLink Dl3Cmac control-message integrity tag:
@@ -905,118 +900,106 @@ pub(super) fn open_in(ks: &[u8; 16], in_riv: &[u8; 8], seq: u32, ct: &[u8]) -> R
     }
     Ok(pt)
 }
-/// Decrypt an EDID reply and return its complete base block and extensions.
+fn interactive_reply_ciphertext(wire: &[u8]) -> Option<(u32, &[u8])> {
+    if wire.len() < 32
+        || u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]) & 0x7fff_ffff != 4
+        || u16::from_le_bytes([wire[8], wire[9]]) != 0x45
+        || u16::from_le_bytes([wire[2], wire[3]]) as usize + 4 != wire.len()
+    {
+        return None;
+    }
+    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
+    Some((seq, &wire[16..wire.len() - 16]))
+}
+
+fn valid_edid_length(length: usize) -> bool {
+    (128..=3968).contains(&length) && length % 128 == 0
+}
+
+fn valid_edid_blocks(edid: &[u8]) -> bool {
+    edid.chunks_exact(128)
+        .all(|block| block.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0)
+}
+
+/// Decrypt an EDID reply and return the status-declared base block and extensions.
 ///
-/// EDID replies use wire `sub=0x45` and inner `id=0x194 sub=0x21`. The EDID starts at inner offset
-/// 22 and its base-block extension count determines the returned length. All supported direction
-/// and head RIV variants are checked.
+/// EDID replies use wire `sub=0x45` and inner `id=0x94` or `0x194`, `sub=0x21`; both real-id forms
+/// are observed on supported dock firmware, while `id=0x114` is the internal placeholder. The EDID
+/// starts at inner offset 22. `declared_length` comes from the preceding `id=0x44 sub=0x20` status
+/// record. The EDID base block must declare the same number of extension blocks and every 128-byte
+/// block must have a valid checksum. Protocol padding after the EDID is ignored. All supported
+/// direction and head RIV variants are checked.
 pub(super) fn parse_edid_from_reply(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
+    declared_length: u16,
 ) -> Result<Option<KVec<u8>>> {
-    // Wire header: [.. type@4 u32 .. sub@8 u16 .. seq@12 u32]; body at off16.
-    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
+    let total = declared_length as usize;
+    if !valid_edid_length(total) {
         return Ok(None);
     }
-    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let body = &wire[16..];
+    let Some((seq, body)) = interactive_reply_ciphertext(wire) else {
+        return Ok(None);
+    };
     for riv in inbound_reply_rivs(out_riv) {
         let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         // Inner header: [id u16][sub u16][counter u16][00 00]; EDID payload at off22.
         const EDID_OFF: usize = 22;
-        if inner.len() < EDID_OFF + 128 {
-            continue;
-        }
-        let id = u16::from_le_bytes([inner[0], inner[1]]);
-        let sub = u16::from_le_bytes([inner[2], inner[3]]);
-        // Some firmware reports the EDID reply id without the high bit.
-        if (id != 0x94 && id != 0x194) || sub != 0x21 {
-            continue;
-        }
-        let edid = &inner[EDID_OFF..];
-        // Validate the EDID base-block magic `00 FF FF FF FF FF FF 00`.
-        const MAGIC: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
-        if edid[..8] != MAGIC {
-            continue;
-        }
-        let total = ((1 + edid[126] as usize) * 128).min(edid.len());
-        let mut out = KVec::with_capacity(total, GFP_KERNEL)?;
-        out.extend_from_slice(&edid[..total], GFP_KERNEL)?;
-        return Ok(Some(out));
-    }
-    Ok(None)
-}
-/// Decode the downstream status carried by an EDID probe reply.
-///
-/// Returns the inner message id, the little-endian status at offsets 22 through 25 and the ready
-/// bit at offset 26. `None` means no matching reply was decrypted.
-pub(super) fn probe_reply_status(
-    ks: &[u8; 16],
-    out_riv: &[u8; 8],
-    wire: &[u8],
-) -> Option<(u16, u32, bool)> {
-    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
-        return None;
-    }
-    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let body = &wire[16..];
-    for riv in inbound_reply_rivs(out_riv) {
-        let Ok(inner) = open_in(ks, &riv, seq, body) else {
-            continue;
-        };
-        if inner.len() < 8 {
+        if inner.len() < EDID_OFF + total {
             continue;
         }
         let id = u16::from_le_bytes([inner[0], inner[1]]);
         let sub = u16::from_le_bytes([inner[2], inner[3]]);
         let pad = u16::from_le_bytes([inner[6], inner[7]]);
-        if id >= 0x400 || pad != 0 {
+        if !matches!(id, 0x94 | 0x194) || sub != 0x21 || pad != 0 {
             continue;
         }
-        // Ignore unrelated traffic: only a downstream capability/EDID handler response or a
-        // generic negative acknowledgment can answer this probe.
-        if !(matches!(id, 0x44 | 0x78 | 0x194) && sub == 0x0020) && id != 0x14 {
+        let edid = &inner[EDID_OFF..EDID_OFF + total];
+        // Validate the EDID base-block magic `00 FF FF FF FF FF FF 00`.
+        const MAGIC: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+        if edid[..8] != MAGIC
+            || (1 + edid[126] as usize) * 128 != total
+            || !valid_edid_blocks(edid)
+        {
             continue;
         }
-        // A short generic ack (the `id=0x14` the dock sends when it cannot route the probe)
-        // carries no status region at all; report zeros rather than refusing to decode, so the
-        // caller still learns the id.
-        let status = if inner.len() >= 26 {
-            u32::from_le_bytes([inner[22], inner[23], inner[24], inner[25]])
-        } else {
-            0
-        };
-        let ready = inner.len() >= 27 && inner[26] & 0x80 != 0;
-        return Some((id, status, ready));
+        let mut out = KVec::with_capacity(total, GFP_KERNEL)?;
+        out.extend_from_slice(edid, GFP_KERNEL)?;
+        return Ok(Some(out));
     }
-    None
+    Ok(None)
 }
-/// Decode an EDID-readiness probe reply.
+
+/// Decode the downstream status carried by an EDID status reply.
 ///
-/// Inner offset 26 bit 7 indicates that the downstream DDC read has completed. `None` distinguishes
-/// an unrelated or undecipherable frame from a matching reply that is not ready.
-pub(super) fn edid_poll_ready(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<bool> {
-    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
-        return None;
-    }
-    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let body = &wire[16..];
+/// `id=0x44 sub=0x20` carries monitor presence in the low two bits of inner offset 24,
+/// `EDIDAvailable` in bit 2, and a little-endian EDID length at offsets 26..27. This layout is used
+/// by DLM's native status structure; offset 26 is the low length byte, not a readiness flag.
+pub(super) fn parse_edid_status(
+    ks: &[u8; 16],
+    out_riv: &[u8; 8],
+    wire: &[u8],
+) -> Option<(u8, bool, u16)> {
+    let (seq, body) = interactive_reply_ciphertext(wire)?;
     for riv in inbound_reply_rivs(out_riv) {
         let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
-        if inner.len() < 27 {
+        if inner.len() < 28 {
             continue;
         }
         let id = u16::from_le_bytes([inner[0], inner[1]]);
         let sub = u16::from_le_bytes([inner[2], inner[3]]);
-        if id != 0x44 || sub != 0x20 {
+        let pad = u16::from_le_bytes([inner[6], inner[7]]);
+        if id != 0x44 || sub != 0x20 || pad != 0 {
             continue;
         }
-        return Some(inner[26] & 0x80 != 0);
+        let flags = inner[24];
+        let length = u16::from_le_bytes([inner[26], inner[27]]);
+        return Some((flags & 0x03, flags & 0x04 != 0, length));
     }
     None
 }

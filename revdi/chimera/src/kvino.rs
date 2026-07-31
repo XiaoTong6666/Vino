@@ -1,10 +1,10 @@
-//! The in-kernel vino control-plane code, compiled verbatim in userspace.
+//! The open Vino control-plane and codec code, compiled verbatim in userspace.
 //!
-//! [`cp`] and [`proto`] are the **actual kernel source files**
-//! (`drivers/gpu/drm/vino/{cp,proto}.rs`) pulled in with `include!`. They see
+//! [`cp`] and [`proto`] are the retained Vino sources pulled in with `include!`.
+//! They see
 //! the kernel-prelude shim ([`crate::kshim`]) through their own `use super::*;`,
 //! so the AES-CTR seal, the Dl3Cmac, the wire framing and every CP message
-//! builder are byte-for-byte the code that ships in `vino.ko`.
+//! builder remain byte-for-byte identical to the open implementation.
 //!
 //! The kernel marks those items `pub(super)` (module-private to the driver), so
 //! this module re-exposes the ones the rig drives through thin `pub` wrappers.
@@ -14,37 +14,34 @@
 // `bindings` modules) into scope as the parent the included files resolve
 // `super::*` against.
 pub use crate::kshim::*;
-pub use ::kernel::drm::display::hdcp as drm_hdcp;
 
-// The literal kernel files, loaded as real modules (so their inner `//!` docs and
-// `#![allow(..)]` resolve natively). They live in `chimera/vino/`, vendored from
-// the kernel tree by `scripts/sync-kernel-sources.sh` so this project builds
-// standalone. Never hand-edit them: edit the kernel tree and re-run that script,
-// or the byte-exactness these proofs rest on quietly stops meaning anything.
+// The retained Vino files are loaded as real modules so their inner `//!` docs
+// and `#![allow(..)]` resolve natively. They live in `chimera/vino/` so the
+// userspace service and byte-exact oracle share one implementation.
 
 /// The literal kernel `proto.rs` (wire framing + plaintext session-init).
 /// `dead_code` is allowed because the rig drives only the CP subset of the file.
 #[path = "../vino/proto.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod proto;
 
 /// The literal kernel `cp.rs` (CP message builders + the AES-CTR/Dl3Cmac seal).
 #[path = "../vino/cp.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod cp;
 
 /// The literal kernel `video.rs` (Vino WHT codec + EP08 transport framing).
 /// `dead_code` is allowed because the rig drives only the solid-strip path.
 #[path = "../vino/video.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod video;
 
 /// The literal kernel video-decoder configuration builder.
 #[path = "../vino/video_arm.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod video_arm;
 
@@ -52,14 +49,14 @@ pub mod video_arm;
 /// parser). Pure functions -- no kernel-only types -- so it joins the shim with
 /// zero drift, exactly like `cp`/`proto`.
 #[path = "../vino/ake.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod ake;
 
 /// The literal kernel `hdcp.rs` (HDCP 2.2 KDF: dKey/kd/H'/L'/V, RSA-OAEP km wrap,
 /// SKE `Edkey(ks)`). Also pure -- built on the shimmed `crypto`/`rng`.
 #[path = "../vino/hdcp.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::all)]
 #[rustfmt::skip]
 pub mod hdcp;
 
@@ -146,7 +143,7 @@ pub fn stream_commit(counter: u16, head: u8) -> Result<Vec<u8>> {
     Ok(cp::stream_commit(counter, head)?.into_vec())
 }
 
-pub fn cp_session_key(ske_ks: &[u8; 16]) -> ::kernel::crypto::Secret<16> {
+pub fn cp_session_key(ske_ks: &[u8; 16]) -> [u8; 16] {
     cp::cp_session_key(ske_ks)
 }
 
@@ -160,9 +157,27 @@ pub fn get_edid_req(counter: u16, head: u8) -> Result<Vec<u8>> {
 }
 
 /// `cp::get_edid_req_sub` — OUT `id=0x15` EDID-family request with an explicit sub
-/// (`0x20` readiness probe / `0x21` fetch).
+/// (`0x20` monitor/EDID status / `0x21` fetch).
 pub fn get_edid_req_sub(counter: u16, sub: u16, head: u8) -> Result<Vec<u8>> {
     Ok(cp::get_edid_req_sub(counter, sub, head)?.into_vec())
+}
+
+/// The monitor-control I2C address accepted by the dock's DDC/CI tunnel.
+pub const DDCCI_I2C_ADDR: u16 = cp::DDCCI_I2C_ADDR as u16;
+
+/// `cp::ddc_forward` — tunnel one raw DDC/CI write to a downstream head.
+pub fn ddc_forward(counter: u16, head: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    Ok(cp::ddc_forward(counter, head, payload)?.into_vec())
+}
+
+/// `cp::ddc_read_req` — fetch the result of the preceding DDC/CI command.
+pub fn ddc_read_req(counter: u16, head: u8) -> Result<Vec<u8>> {
+    Ok(cp::ddc_read_req(counter, head)?.into_vec())
+}
+
+/// `cp::parse_ddc_reply` — decode the bounded DDC/CI payload from a dock reply.
+pub fn parse_ddc_reply(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Result<Option<Vec<u8>>> {
+    Ok(cp::parse_ddc_reply(ks, out_riv, wire)?.map(|payload| payload.into_vec()))
 }
 
 /// `cp::device_query_req` — OUT `id=0x14` device-status/capability query with an
@@ -185,21 +200,22 @@ pub fn post_edid_query(counter: u16, head: u8) -> Result<Vec<u8>> {
     Ok(cp::post_edid_query(counter, head)?.into_vec())
 }
 
-/// `cp::edid_poll_ready` — decode an `id=0x0044 sub=0x0020` EDID-readiness probe
-/// reply and report whether the dock's downstream DDC/EDID read has finished
-/// (inner byte offset 26, `0x00` busy -> `0x80` ready). `None` if `wire` isn't a
-/// decryptable `sub=0x0020` reply at all.
-pub fn edid_poll_ready(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<bool> {
-    cp::edid_poll_ready(ks, out_riv, wire)
+/// `cp::parse_edid_status` — decode presence, availability, and declared length from an
+/// `id=0x44 sub=0x20` status reply.
+pub fn parse_edid_status(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<(u8, bool, u16)> {
+    cp::parse_edid_status(ks, out_riv, wire)
 }
 
-/// `cp::probe_reply_status` — decode the handler and status of a presence probe.
-pub fn probe_reply_status(
+pub fn decode_in_lenient(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<(u16, u16, u16)> {
+    cp::decode_in_lenient(ks, out_riv, wire)
+}
+
+pub fn decode_any(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-) -> Option<(u16, u32, bool)> {
-    cp::probe_reply_status(ks, out_riv, wire)
+) -> Option<(&'static str, u16, u16, u16, [u8; 24])> {
+    cp::decode_any(ks, out_riv, wire)
 }
 
 /// `cp::cursor_create` inner plaintext.
@@ -207,10 +223,9 @@ pub fn cursor_create(counter: u16, head: u8, w: u16, h: u16) -> Result<Vec<u8>> 
     Ok(cp::cursor_create(counter, head, w, h)?.into_vec())
 }
 
-/// `cp::cursor_move` inner plaintext. `visible` drives the dock's own visible flag; clearing it is
-/// how the cursor is hidden, because the dock wraps an out-of-range origin instead of clipping.
-pub fn cursor_move(counter: u16, head: u8, x: u16, y: u16, visible: bool) -> Result<Vec<u8>> {
-    Ok(cp::cursor_move(counter, head, x, y, visible)?.into_vec())
+/// `cp::cursor_move` inner plaintext.
+pub fn cursor_move(counter: u16, head: u8, x: u16, y: u16) -> Result<Vec<u8>> {
+    Ok(cp::cursor_move(counter, head, x, y)?.into_vec())
 }
 
 /// `cp::cursor_image` inner plaintext (32-byte header + `w*h*4` BGRA bitmap).
@@ -223,8 +238,9 @@ pub fn parse_edid_from_reply(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
+    declared_length: u16,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(cp::parse_edid_from_reply(ks, out_riv, wire)?.map(|v| v.into_vec()))
+    Ok(cp::parse_edid_from_reply(ks, out_riv, wire, declared_length)?.map(|v| v.into_vec()))
 }
 
 pub const CP_SETUP_PER_HEAD: [(u16, u16, usize); 9] = cp::CP_SETUP_PER_HEAD;
@@ -291,6 +307,43 @@ pub fn colour_frame_ep08_head(
             .into_vec()
             .into_iter()
             .map(|f| f.into_vec())
+            .collect(),
+        seq,
+    ))
+}
+
+/// Damage-aware WHT frame assembly for one head.
+///
+/// `clips` are half-open output-pixel rectangles. The Vino codec expands each
+/// touched rectangle to the dock's 256x64 backing-buffer macro-tile and emits
+/// all 64x16 strips in that macro-tile. Callers must send a full keyframe after
+/// every mode-set before using this path.
+pub fn colour_frame_ep08_damage_head(
+    width: usize,
+    height: usize,
+    rgb: &[u8],
+    seq0: u32,
+    head: u8,
+    clips: &[(usize, usize, usize, usize)],
+) -> Result<(Vec<Vec<u8>>, u32)> {
+    let (frames, seq) = video::wht::colour_frame_ep08_damage(
+        width,
+        height,
+        seq0,
+        head,
+        clips,
+        true,
+        false,
+        |x, y| {
+            let i = (y * width + x) * 3;
+            (rgb[i], rgb[i + 1], rgb[i + 2])
+        },
+    )?;
+    Ok((
+        frames
+            .into_vec()
+            .into_iter()
+            .map(|frame| frame.into_vec())
             .collect(),
         seq,
     ))
@@ -418,29 +471,6 @@ pub fn video_arm_burst(
     Ok(output)
 }
 
-/// One byte-exact colour 64×16 strip at `(x,y)` from 16 blocks of three raw planes (each 64
-/// samples in the codec's ×64 fixed point, `[Cr, Cb, Y]`), via the kernel `colour_strip`. Same
-/// as [`colour_strip_from_planes`] but exposed for the frame-assembler proof to reconstruct each
-/// strip independently and check the assembler matches it (tail aside).
-pub fn colour_strip_blocks(planes: &[[[i32; 64]; 3]; 16], x: u16, y: u16) -> Result<Vec<u8>> {
-    colour_strip_from_planes(planes, x, y)
-}
-
-/// `video::wht::transform` + `quantize` for one 8×8 plane (values already in the
-/// codec's ×64 fixed point), returning the 32 quantized coeffs.
-pub fn transform_raw(plane: &[i32; 64]) -> [i32; 64] {
-    video::wht::transform(plane)
-}
-
-pub fn transform_quantize(plane: &[i32; 64]) -> [i32; 64] {
-    let c = video::wht::transform(plane);
-    let mut q = [0i32; 64];
-    for i in 0..64 {
-        q[i] = video::wht::quantize(c[i], i);
-    }
-    q
-}
-
 // ---- thin pub wrappers over the kernel's pub(super) AKE/HDCP API -----------
 //
 // Same pattern as the CP wrappers above: `ake`/`hdcp` items are `pub(super)`
@@ -459,6 +489,7 @@ pub mod id {
     pub const AKE_INIT: u8 = k::AKE_INIT;
     pub const AKE_SEND_CERT: u8 = k::AKE_SEND_CERT;
     pub const AKE_NO_STORED_KM: u8 = k::AKE_NO_STORED_KM;
+    pub const AKE_SEND_PAIRING_INFO: u8 = 0x08;
     pub const AKE_SEND_H_PRIME: u8 = k::AKE_SEND_H_PRIME;
     pub const LC_INIT: u8 = k::LC_INIT;
     pub const LC_SEND_L_PRIME: u8 = k::LC_SEND_L_PRIME;
@@ -470,6 +501,7 @@ pub mod id {
     pub const AKE_SEND_RRX: u8 = k::AKE_SEND_RRX;
     pub const RECEIVER_AUTH_STATUS: u8 = k::RECEIVER_AUTH_STATUS;
     pub const AKE_TRANSMITTER_INFO: u8 = k::AKE_TRANSMITTER_INFO;
+    pub const AKE_RECEIVER_INFO: u8 = 0x14;
 }
 
 /// `proto::init_0`/`init_25`/`init_4_probe` — the plaintext session-init
@@ -529,7 +561,7 @@ pub fn ake_parse_in(body: &[u8]) -> Option<(u8, &[u8])> {
 }
 
 pub fn derive_kd(km: &[u8; 16], rtx: &[u8; 8], rrx: &[u8; 8]) -> Result<[u8; 32]> {
-    hdcp::derive_kd(km, rtx, rrx).map(|key| *key)
+    hdcp::derive_kd(km, rtx, rrx)
 }
 pub fn compute_h(kd: &[u8; 32], rtx: &[u8; 8], repeater: bool) -> [u8; 32] {
     hdcp::compute_h(kd, rtx, repeater)
@@ -540,14 +572,8 @@ pub fn compute_l(kd: &[u8; 32], rrx: &[u8; 8], rn: &[u8; 8]) -> [u8; 32] {
 pub fn compute_v_full(kd: &[u8; 32], list_header: &[u8]) -> [u8; 32] {
     hdcp::compute_v_full(kd, list_header)
 }
-pub type RsaPublicKey = ::kernel::crypto::akcipher::RsaPublicKey;
-
-pub fn rsa_public_key(modulus: &[u8; 128], exponent: &[u8]) -> Result<RsaPublicKey> {
-    Ok(RsaPublicKey::new(modulus, exponent, GFP_KERNEL)?)
-}
-
-pub fn oaep_encrypt_km(key: &mut RsaPublicKey, km: &[u8; 16]) -> Result<[u8; 128]> {
-    hdcp::oaep_encrypt_km(key, km)
+pub fn oaep_encrypt_km(modulus: &[u8; 128], exponent: &[u8], km: &[u8; 16]) -> Result<[u8; 128]> {
+    hdcp::oaep_encrypt_km(modulus, exponent, km)
 }
 pub fn compute_eks(
     km: &[u8; 16],
@@ -594,20 +620,114 @@ mod production_builders {
     }
 
     #[test]
-    fn display_capability_reply_reports_presence() {
+    fn ddc_reply_uses_only_the_declared_payload() {
         let key = [0x5a; 16];
         let riv = [0x33; 8];
         let mut inner = [0; 32];
-        inner[0..2].copy_from_slice(&0x78u16.to_le_bytes());
-        inner[2..4].copy_from_slice(&0x20u16.to_le_bytes());
-        inner[22..26].copy_from_slice(&0x1234u32.to_le_bytes());
-        inner[26] = 0x80;
-        let mut frame = seal_interactive(&key, &riv, 0x78, 11, &inner).unwrap();
+        inner[0..2].copy_from_slice(&0x20u16.to_le_bytes());
+        inner[2..4].copy_from_slice(&0x25u16.to_le_bytes());
+        inner[22] = 4;
+        inner[23..27].copy_from_slice(&[0x6e, 0x88, 0x02, 0x90]);
+        let mut frame = seal_interactive(&key, &riv, 0x20, 9, &inner).unwrap();
         frame[8..10].copy_from_slice(&0x45u16.to_le_bytes());
 
         assert_eq!(
-            probe_reply_status(&key, &riv, &frame),
-            Some((0x78, 0x1234, true))
+            parse_ddc_reply(&key, &riv, &frame).unwrap().unwrap(),
+            [0x6e, 0x88, 0x02, 0x90]
+        );
+        inner[22] = 16;
+        let mut malformed = seal_interactive(&key, &riv, 0x20, 10, &inner).unwrap();
+        malformed[8..10].copy_from_slice(&0x45u16.to_le_bytes());
+        assert!(parse_ddc_reply(&key, &riv, &malformed).is_err());
+    }
+
+    #[test]
+    fn edid_status_reply_reports_presence_availability_and_length() {
+        let key = [0x5a; 16];
+        let riv = [0x33; 8];
+        let mut inner = [0; 32];
+        inner[0..2].copy_from_slice(&0x44u16.to_le_bytes());
+        inner[2..4].copy_from_slice(&0x20u16.to_le_bytes());
+        inner[24] = 0x06;
+        inner[26..28].copy_from_slice(&384u16.to_le_bytes());
+        let mut frame = seal_interactive(&key, &riv, 0x44, 11, &inner).unwrap();
+        frame[8..10].copy_from_slice(&0x45u16.to_le_bytes());
+        frame[7] |= 0x80;
+
+        assert_eq!(parse_edid_status(&key, &riv, &frame), Some((2, true, 384)));
+    }
+
+    fn fix_edid_checksum(block: &mut [u8]) {
+        let sum = block[..127]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        block[127] = 0u8.wrapping_sub(sum);
+    }
+
+    fn synthetic_edid(blocks: usize) -> Vec<u8> {
+        let mut edid = vec![0u8; blocks * 128];
+        edid[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+        edid[8..10].copy_from_slice(&[0x61, 0xa4]);
+        edid[18] = 1;
+        edid[19] = 4;
+        edid[126] = (blocks - 1) as u8;
+        fix_edid_checksum(&mut edid[..128]);
+        for block in edid[128..].chunks_exact_mut(128) {
+            block[0..4].copy_from_slice(&[0x02, 0x03, 0x04, 0x00]);
+            fix_edid_checksum(block);
+        }
+        edid
+    }
+
+    fn synthetic_edid_reply(id: u16, edid: &[u8]) -> Vec<u8> {
+        let key = [0x5a; 16];
+        let riv = [0x33; 8];
+        let mut inner = vec![0u8; 22 + edid.len() + 10];
+        inner[0..2].copy_from_slice(&id.to_le_bytes());
+        inner[2..4].copy_from_slice(&0x21u16.to_le_bytes());
+        inner[4..6].copy_from_slice(&7u16.to_le_bytes());
+        inner[22..22 + edid.len()].copy_from_slice(edid);
+        let mut frame = seal_interactive(&key, &riv, id, 12, &inner).unwrap();
+        frame[8..10].copy_from_slice(&0x45u16.to_le_bytes());
+        frame[7] |= 0x80;
+        frame
+    }
+
+    #[test]
+    fn edid_reply_uses_declared_length_and_validates_every_block() {
+        let key = [0x5a; 16];
+        let riv = [0x33; 8];
+        let edid = synthetic_edid(3);
+        let frame = synthetic_edid_reply(0x194, &edid);
+
+        assert_eq!(
+            parse_edid_from_reply(&key, &riv, &frame, 384)
+                .unwrap()
+                .unwrap(),
+            edid
+        );
+        assert!(parse_edid_from_reply(&key, &riv, &frame, 256)
+            .unwrap()
+            .is_none());
+
+        let mut bad_checksum = synthetic_edid(3);
+        bad_checksum[128 + 10] ^= 1;
+        let frame = synthetic_edid_reply(0x194, &bad_checksum);
+        assert!(parse_edid_from_reply(&key, &riv, &frame, 384)
+            .unwrap()
+            .is_none());
+
+        let placeholder = synthetic_edid_reply(0x114, &edid);
+        assert!(parse_edid_from_reply(&key, &riv, &placeholder, 384)
+            .unwrap()
+            .is_none());
+
+        let short_real_id = synthetic_edid_reply(0x94, &edid);
+        assert_eq!(
+            parse_edid_from_reply(&key, &riv, &short_real_id, 384)
+                .unwrap()
+                .unwrap(),
+            edid
         );
     }
 }

@@ -1,29 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! DisplayLinkManager-compatible Revdi-to-Vino service.
+//! DisplayLinkManager-compatible EVDI-to-Vino service.
 
-use crate::revdi::{self, Cursor, DeviceEvent, Mode, RevdiCard};
+use crate::evdi::{self, Cursor, DamageRect, Device, DeviceEvent, Mode};
 use crate::session::ControlSession;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-const HEADS: usize = 2;
+const ACTIVE_HEADS: [u8; 1] = [0];
 const FRAME_WAIT: Duration = Duration::from_millis(8);
 const KEEPALIVE_PERIOD: Duration = Duration::from_millis(13);
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(3);
-const PRESENCE_PERIOD: Duration = Duration::from_secs(1);
-const PRESENCE_GRACE: Duration = Duration::from_secs(10);
-const PRESENCE_SILENT_LIMIT: u8 = 3;
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+const PREARM_MODE: Mode = Mode {
+    width: 1920,
+    height: 1080,
+    refresh_hz: 60,
+    bits_per_pixel: 32,
+    pixel_format: u32::from_le_bytes(*b"AR24"),
+};
 
 struct Output {
     head: u8,
-    card: RevdiCard,
+    card: Device,
     mode: Option<Mode>,
     active: bool,
+    keyframe_pending: bool,
+    previous_rgb: Option<Vec<u8>>,
     cursor_hotspot: (i32, i32),
-    presence_debounce: u8,
-    silent_probes: u8,
-    presence_grace_until: Instant,
 }
 
 /// Run the service, rebuilding the complete owned session after a transport failure.
@@ -36,19 +40,49 @@ pub fn run() -> Result<(), String> {
     }
 }
 
-/// Engage the dock, expose connected sinks through Revdi, and forward compositor frames.
+/// Engage the dock, expose connected sinks through EVDI, and forward compositor frames.
 fn run_session() -> Result<(), String> {
-    let mut session = ControlSession::engage()?;
-    let mut outputs: [Option<Output>; HEADS] = core::array::from_fn(|_| None);
-    for head in 0..HEADS {
-        if session.probe_head_present(head as u8)? == Some(true) {
-            connect_output(&mut session, &mut outputs[head], head as u8);
-        }
-    }
+    let head = ACTIVE_HEADS[0];
+    let trace_frames = std::env::var_os("VINO_TRACE_FRAMES").is_some();
+    println!("head {head}: opening EVDI output");
+    flush_standard_streams(head, "before Device::open");
+    let mut card = Device::open().map_err(|error| format!("open EVDI output: {error}"))?;
+    println!("head {head}: EVDI output opened");
+    flush_standard_streams(head, "after Device::open");
+
+    let mut session = ControlSession::engage_head(head)?;
+    session.activate_mode(
+        head,
+        PREARM_MODE.width,
+        PREARM_MODE.height,
+        PREARM_MODE.refresh_hz,
+    )?;
+    println!(
+        "head {head}: dock pre-armed at {}x{}@{}",
+        PREARM_MODE.width, PREARM_MODE.height, PREARM_MODE.refresh_hz
+    );
+    let edid = session
+        .fetch_edid(head)
+        .map_err(|error| format!("fetch head-{head} EDID from dock: {error}"))?;
+    println!("head {head}: fetched {} EDID bytes from dock", edid.len());
+    println!("head {head}: connecting EVDI monitor");
+    flush_standard_streams(head, "before connect_monitor");
+    evdi::connect_monitor(&mut card, &edid)
+        .map_err(|error| format!("connect EVDI output: {error}"))?;
+    println!("head {head}: EVDI monitor connected");
+    flush_standard_streams(head, "after connect_monitor");
+    let mut outputs = [Some(Output {
+        head,
+        card,
+        mode: Some(PREARM_MODE),
+        active: true,
+        keyframe_pending: true,
+        previous_rgb: None,
+        cursor_hotspot: (0, 0),
+    })];
 
     let mut next_keepalive = Instant::now() + KEEPALIVE_PERIOD;
     let mut next_heartbeat = Instant::now() + HEARTBEAT_PERIOD;
-    let mut next_presence = Instant::now() + PRESENCE_PERIOD;
     loop {
         for output in outputs.iter_mut().flatten() {
             for event in output.card.events(Duration::ZERO) {
@@ -62,28 +96,103 @@ fn run_session() -> Result<(), String> {
             };
             let width = frame.width;
             let height = frame.height;
-            let rgb = revdi::to_rgb888(&frame);
+            let raw_damage_rects = frame.damage.len();
+            let raw_clips = damage_clips(&frame.damage, width, height);
+            if !output.keyframe_pending && raw_clips.is_empty() {
+                continue;
+            }
+            let rgb = evdi::to_rgb888(&frame);
             drop(frame);
 
             let Some(mode) = output.card.mode() else {
                 continue;
             };
             if Some(mode) != output.mode {
-                session.activate_mode(output.head, mode.width, mode.height, mode.refresh_hz)?;
-                output.mode = Some(mode);
+                return Err(format!(
+                    "head {} compositor mode {}x{}@{} differs from pre-armed {}x{}@{}",
+                    output.head,
+                    mode.width,
+                    mode.height,
+                    mode.refresh_hz,
+                    PREARM_MODE.width,
+                    PREARM_MODE.height,
+                    PREARM_MODE.refresh_hz,
+                ));
             }
             let (padded, padded_width, padded_height) = pad_rgb(&rgb, width, height);
-            session.present_rgb(output.head, padded_width, padded_height, &padded)?;
-        }
-        if Instant::now() >= next_presence {
-            refresh_topology(&mut session, &mut outputs)?;
-            next_presence = Instant::now() + PRESENCE_PERIOD;
+            let keyframe = output.keyframe_pending
+                || output
+                    .previous_rgb
+                    .as_ref()
+                    .is_none_or(|previous| previous.len() != padded.len());
+            let clips = if keyframe {
+                raw_clips
+            } else {
+                changed_strip_clips(
+                    output.previous_rgb.as_deref().expect("checked above"),
+                    &padded,
+                    padded_width,
+                    padded_height,
+                    &raw_clips,
+                )
+            };
+            if !keyframe && clips.is_empty() {
+                continue;
+            }
+            let encoded_bytes = if keyframe {
+                session.present_rgb(output.head, padded_width, padded_height, &padded)?
+            } else {
+                session.present_rgb_damage(
+                    output.head,
+                    padded_width,
+                    padded_height,
+                    &padded,
+                    &clips,
+                )?
+            };
+            if keyframe {
+                output.keyframe_pending = false;
+            }
+            output.previous_rgb = Some(padded);
+            if trace_frames && encoded_bytes != 0 {
+                let damage_bounds = clip_bounds(&clips);
+                println!(
+                    "head {}: frame kind={} raw_damage_rects={} effective_strips={} encoded_bytes={} damage_bounds={damage_bounds:?}",
+                    output.head,
+                    if keyframe { "keyframe" } else { "damage" },
+                    raw_damage_rects,
+                    clips.len(),
+                    encoded_bytes,
+                );
+            }
         }
         if Instant::now() >= next_keepalive {
-            session.keepalive_poll()?;
+            if outputs.iter().flatten().any(|output| output.active) {
+                session.keepalive_poll()?;
+            }
             next_keepalive = Instant::now() + KEEPALIVE_PERIOD;
         }
         if Instant::now() >= next_heartbeat {
+            if trace_frames {
+                for output in outputs.iter().flatten() {
+                    let diagnostics = output.card.diagnostics();
+                    println!(
+                        "head {}: evdi state mode={:?} active={} poll_wakeups={} mode_events={} dpms_events={} crtc_events={} update_requests={} immediate_updates={} update_ready_events={} update_timeouts={} grabs={}",
+                        output.head,
+                        output.card.mode(),
+                        output.active,
+                        diagnostics.poll_wakeups,
+                        diagnostics.mode_events,
+                        diagnostics.dpms_events,
+                        diagnostics.crtc_events,
+                        diagnostics.update_requests,
+                        diagnostics.immediate_updates,
+                        diagnostics.update_ready_events,
+                        diagnostics.update_timeouts,
+                        diagnostics.grabs,
+                    );
+                }
+            }
             session.heartbeat()?;
             next_heartbeat = Instant::now() + HEARTBEAT_PERIOD;
         }
@@ -93,77 +202,28 @@ fn run_session() -> Result<(), String> {
     }
 }
 
-fn connect_output(session: &mut ControlSession, slot: &mut Option<Output>, head: u8) {
-    let result = (|| -> Result<Output, String> {
-        let edid = session
-            .fetch_edid(head)
-            .map_err(|error| format!("fetch EDID: {error}"))?;
-        let mut card = RevdiCard::open().map_err(|error| format!("open Revdi output: {error}"))?;
-        revdi::connect_monitor(&mut card, &edid)
-            .map_err(|error| format!("connect Revdi output: {error}"))?;
-        Ok(Output {
-            head,
-            card,
-            mode: None,
-            active: false,
-            cursor_hotspot: (0, 0),
-            presence_debounce: 0,
-            silent_probes: 0,
-            presence_grace_until: Instant::now() + PRESENCE_GRACE,
-        })
-    })();
-    match result {
-        Ok(output) => {
-            println!("head {head}: monitor connected; waiting for a compositor mode");
-            *slot = Some(output);
-        }
-        Err(error) => eprintln!("head {head}: {error}"),
-    }
-}
+fn flush_standard_streams(head: u8, stage: &str) {
+    let stdout_started = Instant::now();
+    let stdout_result = io::stdout().lock().flush();
+    let stdout_elapsed = stdout_started.elapsed();
 
-fn refresh_topology(
-    session: &mut ControlSession,
-    outputs: &mut [Option<Output>; HEADS],
-) -> Result<(), String> {
-    for (head, slot) in outputs.iter_mut().enumerate() {
-        // A deliberate DPMS-off closes the downstream stream and can look like removal.
-        if slot
-            .as_ref()
-            .is_some_and(|output| output.mode.is_some() && !output.active)
-        {
-            continue;
-        }
-        let present = session.probe_head_present(head as u8)?;
-        let Some(output) = slot.as_mut() else {
-            if present == Some(true) {
-                connect_output(session, slot, head as u8);
-            }
-            continue;
-        };
-        let present = match present {
-            Some(present) => {
-                output.silent_probes = 0;
-                present
-            }
-            None => {
-                output.silent_probes = output.silent_probes.saturating_add(1);
-                if output.silent_probes < PRESENCE_SILENT_LIMIT {
-                    continue;
-                }
-                false
-            }
-        };
-        if present || Instant::now() < output.presence_grace_until {
-            output.presence_debounce = 0;
-            continue;
-        }
-        output.presence_debounce = output.presence_debounce.saturating_add(1);
-        if output.presence_debounce >= 2 {
-            println!("head {head}: monitor disconnected");
-            *slot = None;
-        }
-    }
-    Ok(())
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "head {head}: stdout.flush() {stage} returned in {stdout_elapsed:?}: {}",
+        if stdout_result.is_ok() { "ok" } else { "error" }
+    );
+    let _ = stderr.flush();
+
+    let stderr_started = Instant::now();
+    let stderr_result = stderr.flush();
+    let stderr_elapsed = stderr_started.elapsed();
+    let _ = writeln!(
+        stderr,
+        "head {head}: stderr.flush() {stage} returned in {stderr_elapsed:?}: {}",
+        if stderr_result.is_ok() { "ok" } else { "error" }
+    );
+    let _ = stderr.flush();
 }
 
 fn handle_event(
@@ -173,19 +233,30 @@ fn handle_event(
 ) -> Result<(), String> {
     match event {
         DeviceEvent::Mode(mode) if Some(mode) != output.mode => {
-            session.activate_mode(output.head, mode.width, mode.height, mode.refresh_hz)?;
+            return Err(format!(
+                "head {} compositor mode {}x{}@{} differs from pre-armed {}x{}@{}",
+                output.head,
+                mode.width,
+                mode.height,
+                mode.refresh_hz,
+                PREARM_MODE.width,
+                PREARM_MODE.height,
+                PREARM_MODE.refresh_hz,
+            ));
+        }
+        DeviceEvent::Mode(mode) => {
             println!(
                 "head {}: active at {}x{}@{}",
                 output.head, mode.width, mode.height, mode.refresh_hz
             );
-            output.mode = Some(mode);
-            output.active = true;
         }
-        DeviceEvent::Mode(_) | DeviceEvent::CrtcState(_) => {}
+        DeviceEvent::CrtcState(_) => {}
         DeviceEvent::Dpms(0) if !output.active => {
             if let Some(mode) = output.mode {
                 session.activate_mode(output.head, mode.width, mode.height, mode.refresh_hz)?;
                 output.active = true;
+                output.keyframe_pending = true;
+                output.previous_rgb = None;
             }
         }
         DeviceEvent::Dpms(0) => {}
@@ -195,6 +266,7 @@ fn handle_event(
                 .ok_or_else(|| format!("head {} has no active mode", output.head))?;
             session.deactivate_mode(output.head, mode.width, mode.height)?;
             output.active = false;
+            output.previous_rgb = None;
         }
         DeviceEvent::Dpms(_) => {}
         DeviceEvent::CursorSet(cursor) => {
@@ -203,7 +275,7 @@ fn handle_event(
                 let bgra = cursor_bgra(&cursor)?;
                 session.set_cursor(output.head, cursor.width, cursor.height, &bgra)?;
             } else {
-                session.hide_cursor(output.head)?;
+                session.move_cursor(output.head, i32::from(u16::MAX), i32::from(u16::MAX))?;
             }
         }
         DeviceEvent::CursorMove(position) if output.active => {
@@ -275,6 +347,72 @@ fn pad_rgb(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, usize, usize) {
     (padded, padded_width, padded_height)
 }
 
+fn damage_clips(
+    damage: &[DamageRect],
+    width: usize,
+    height: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    damage
+        .iter()
+        .filter_map(|rect| {
+            let x0 = usize::try_from(rect.x1.max(0)).ok()?.min(width);
+            let y0 = usize::try_from(rect.y1.max(0)).ok()?.min(height);
+            let x1 = usize::try_from(rect.x2.max(0)).ok()?.min(width);
+            let y1 = usize::try_from(rect.y2.max(0)).ok()?.min(height);
+            (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+        })
+        .collect()
+}
+
+fn changed_strip_clips(
+    previous: &[u8],
+    current: &[u8],
+    width: usize,
+    height: usize,
+    coarse_clips: &[(usize, usize, usize, usize)],
+) -> Vec<(usize, usize, usize, usize)> {
+    const STRIP_W: usize = 64;
+    const STRIP_H: usize = 16;
+    if previous.len() != current.len() || current.len() != width * height * 3 {
+        return vec![(0, 0, width, height)];
+    }
+
+    let mut changed = Vec::new();
+    for sy in (0..height).step_by(STRIP_H) {
+        for sx in (0..width).step_by(STRIP_W) {
+            let x1 = (sx + STRIP_W).min(width);
+            let y1 = (sy + STRIP_H).min(height);
+            if !coarse_clips
+                .iter()
+                .any(|&(x0, y0, x2, y2)| sx < x2 && x0 < x1 && sy < y2 && y0 < y1)
+            {
+                continue;
+            }
+            let differs = (sy..y1).any(|y| {
+                let start = (y * width + sx) * 3;
+                let end = (y * width + x1) * 3;
+                previous[start..end] != current[start..end]
+            });
+            if differs {
+                changed.push((sx, sy, x1, y1));
+            }
+        }
+    }
+    changed
+}
+
+fn clip_bounds(clips: &[(usize, usize, usize, usize)]) -> Option<(usize, usize, usize, usize)> {
+    let first = *clips.first()?;
+    Some(clips[1..].iter().fold(first, |bounds, clip| {
+        (
+            bounds.0.min(clip.0),
+            bounds.1.min(clip.1),
+            bounds.2.max(clip.2),
+            bounds.3.max(clip.3),
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +444,68 @@ mod tests {
         assert_eq!(
             cursor_bgra(&cursor).unwrap(),
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn clamps_and_discards_invalid_damage() {
+        let clips = damage_clips(
+            &[
+                DamageRect {
+                    x1: -10,
+                    y1: -20,
+                    x2: 40,
+                    y2: 50,
+                },
+                DamageRect {
+                    x1: 1900,
+                    y1: 1000,
+                    x2: 2100,
+                    y2: 1200,
+                },
+                DamageRect {
+                    x1: 80,
+                    y1: 80,
+                    x2: 40,
+                    y2: 40,
+                },
+            ],
+            1920,
+            1080,
+        );
+        assert_eq!(clips, [(0, 0, 40, 50), (1900, 1000, 1920, 1080)]);
+    }
+
+    #[test]
+    fn damage_frame_is_smaller_than_a_keyframe() {
+        let (width, height) = (512, 128);
+        let rgb = vec![0u8; width * height * 3];
+        let (keyframe, _) =
+            crate::kvino::colour_frame_ep08_head(width, height, &rgb, 0, 0).expect("keyframe");
+        let (damage, _) =
+            crate::kvino::colour_frame_ep08_damage_head(width, height, &rgb, 1, 0, &[(1, 1, 2, 2)])
+                .expect("damage frame");
+        let keyframe_bytes: usize = keyframe.iter().map(Vec::len).sum();
+        let damage_bytes: usize = damage.iter().map(Vec::len).sum();
+        assert!(!damage.is_empty());
+        assert!(damage_bytes < keyframe_bytes);
+    }
+
+    #[test]
+    fn pixel_diff_refines_full_damage_to_changed_strips() {
+        let (width, height) = (128, 32);
+        let previous = vec![0u8; width * height * 3];
+        let mut current = previous.clone();
+        let changed_pixel = (20 * width + 70) * 3;
+        current[changed_pixel..changed_pixel + 3].copy_from_slice(&[1, 2, 3]);
+
+        assert_eq!(
+            changed_strip_clips(&previous, &current, width, height, &[(0, 0, width, height)]),
+            [(64, 16, 128, 32)]
+        );
+        assert!(
+            changed_strip_clips(&current, &current, width, height, &[(0, 0, width, height)])
+                .is_empty()
         );
     }
 }

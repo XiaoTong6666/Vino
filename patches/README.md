@@ -1,16 +1,19 @@
-# Generated kernel patches
+# Generated patch sets
 
-[`kernel/`](kernel/README.md) is generated from
-`linux:integration/base-20260728..vino-upstream-rebuild` by
-[`../tools/regenerate-patches.sh`](../tools/regenerate-patches.sh). Do not edit
-the patch files by hand; amend the source history and regenerate.
+The patch files are generated from the external kernel working repository by
+`../tools/regenerate-patches.sh`. Do not hand-edit generated patches; change the
+source commit and regenerate.
 
-The export contains:
+| Directory | Source range |
+|---|---|
+| [`kernel/`](kernel/README.md) | `integration/base-20260727..series/vino-upstream` |
+
+Each directory contains:
 
 - numbered `git format-patch` output;
 - `series`, in application order;
-- `manifest.tsv`, mapping each patch to its commit, author, and subject;
-- `groups/*.series`, separating independently routed review groups.
+- `manifest.tsv`, mapping filename to commit, author, and subject;
+- a README describing the base and validation.
 
-Revdi and Chimera are source directories in the top-level repository, not a
-second generated patch series.
+Run `../tools/check-series.sh` to apply the kernel series in a disposable
+worktree and compare the resulting Git tree object with its source branch.

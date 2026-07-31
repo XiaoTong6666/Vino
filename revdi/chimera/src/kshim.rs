@@ -7,9 +7,9 @@
 //! of kernel facilities `cp.rs`/`proto.rs` lean on through `use super::*`:
 //!
 //!   * [`KVec`]      — the kernel's fallible `Vec`, here a thin wrapper over
-//!                     [`std::vec::Vec`] with the same `with_capacity(n, flags)?`
-//!                     / `push(v, flags)?` / `extend_from_slice(s, flags)?` API
-//!                     and a `Deref<[T]>` so all the slice methods work.
+//!     [`std::vec::Vec`] with the same `with_capacity(n, flags)?` /
+//!     `push(v, flags)?` / `extend_from_slice(s, flags)?` API and a `Deref<[T]>`
+//!     so all the slice methods work.
 //!   * [`GFP_KERNEL`]/[`Flags`] — the allocation-flag argument (ignored here).
 //!   * [`Result`]/[`Error`]/error constants — the kernel error type.
 //!   * [`crypto`]    — `Aes128` + `aes_cmac`, the two primitives `cp.rs` calls.
@@ -20,9 +20,14 @@
 
 use core::ops::{Deref, DerefMut};
 
-/// The allocation flag type and `GFP_KERNEL` value from the userspace kernel shim.
-pub use ::kernel::alloc::flags::Flags;
-pub use ::kernel::alloc::flags::GFP_KERNEL;
+/// Stand-in for the kernel allocation flags. The kernel threads these through
+/// every fallible allocation; in userspace allocation is infallible-ish and the
+/// flag is irrelevant, so it carries no data.
+#[derive(Clone, Copy, Debug)]
+pub struct Flags;
+
+/// The `GFP_KERNEL` flag `cp.rs`/`proto.rs` pass to every `KVec` op.
+pub const GFP_KERNEL: Flags = Flags;
 
 /// Stand-in for `kernel::error::Error`. Preserve the errno value so the literal
 /// kernel sources can distinguish malformed arguments from malformed replies.
@@ -32,12 +37,6 @@ pub struct Error(pub i32);
 /// Error constants named directly by the included protocol sources.
 pub const EINVAL: Error = Error(22);
 pub const EPROTO: Error = Error(71);
-
-impl From<::kernel::prelude::Error> for Error {
-    fn from(_: ::kernel::prelude::Error) -> Self {
-        Error(5)
-    }
-}
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -152,8 +151,6 @@ impl<T> DerefMut for VVec<T> {
 /// `kernel::error::code::*` paths the included files name in full. The bare
 /// `EINVAL` (above) and these are the same value via different paths.
 pub mod kernel {
-    pub use ::kernel::crypto;
-
     pub mod error {
         pub mod code {
             use crate::kshim::Error;
@@ -227,8 +224,7 @@ pub mod kernel {
                         }
                     }
                     pub fn vrefresh(&self) -> i32 {
-                        // SAFETY: the stub `drm_mode_vrefresh` dereferences nothing.
-                        unsafe { drm_mode_vrefresh(&self.0) }
+                        drm_mode_vrefresh(&self.0)
                     }
                 }
             }
@@ -299,6 +295,31 @@ pub mod crypto {
         mac.finalize().into_bytes().into()
     }
 
+    /// Raw RSA public-key op `out = input^exponent mod modulus`, big-endian,
+    /// fixed-width. `hdcp.rs::oaep_encrypt_km` applies OAEP padding itself and
+    /// calls this only for the bare modular exponentiation, mirroring the
+    /// kernel's `crypto_akcipher`-backed `kernel::crypto::rsa_pubkey_encrypt`.
+    pub fn rsa_pubkey_encrypt(
+        modulus: &[u8],
+        exponent: &[u8],
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Result {
+        use num_bigint::BigUint;
+        let n = BigUint::from_bytes_be(modulus);
+        let e = BigUint::from_bytes_be(exponent);
+        let m = BigUint::from_bytes_be(input);
+        let c = m.modpow(&e, &n);
+        let bytes = c.to_bytes_be();
+        if bytes.len() > out.len() {
+            return Err(super::EINVAL);
+        }
+        let pad = out.len() - bytes.len();
+        out[..pad].fill(0);
+        out[pad..].copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// `dbl` over GF(2^128) with the AES-CMAC reduction polynomial (Rb = 0x87).
     fn dbl(b: &[u8; 16]) -> [u8; 16] {
         let msb = b[0] >> 7;
@@ -323,7 +344,7 @@ pub mod crypto {
         let k1 = dbl(&l);
         let k2 = dbl(&k1);
 
-        let complete = !data.is_empty() && data.len() % 16 == 0;
+        let complete = !data.is_empty() && data.len().is_multiple_of(16);
         let nblocks = if data.is_empty() {
             1
         } else {
@@ -385,10 +406,7 @@ pub mod bindings {
 
     /// Userspace equivalent of `drm_mode_vrefresh` for progressive modes.
     ///
-    /// # Safety
-    /// `mode` must point to a valid `drm_display_mode`.
-    pub unsafe fn drm_mode_vrefresh(mode: *const drm_display_mode) -> i32 {
-        let mode = &*mode;
+    pub fn drm_mode_vrefresh(mode: &drm_display_mode) -> i32 {
         if mode.clock <= 0 || mode.htotal == 0 || mode.vtotal == 0 {
             return 0;
         }

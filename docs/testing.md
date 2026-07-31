@@ -1,142 +1,100 @@
-# Testing, regeneration, and submission
+# Testing and regeneration
 
-The commands here are build-only or use disposable Git worktrees. They do not
-install or load modules, install or boot a kernel, change the bootloader, stop
-the desktop, access the dock, or reboot.
+All commands in this document are build-only or operate on disposable Git
+worktrees. They do not install or load modules, install a kernel, alter a
+bootloader, start or stop DisplayLink services, access hardware, or reboot.
 
-## Regenerate and verify patches
+## Regenerate patches
+
+From the repository root:
 
 ```sh
-./tools/regenerate-patches.sh
-./tools/check-series.sh
+KERNEL_TREE=/path/to/vino-kernel ./tools/regenerate-patches.sh
 ```
 
-To reproduce from another kernel checkout:
+Override a path or range when reproducing elsewhere:
 
 ```sh
 KERNEL_TREE=/work/linux \
-KERNEL_BASE=integration/base-20260728 \
-KERNEL_HEAD=vino-upstream-rebuild \
+KERNEL_BASE=integration/base-20260727 \
+KERNEL_HEAD=series/vino-upstream \
 ./tools/regenerate-patches.sh
 ```
 
-The first command writes the kernel patches, manifest, full `series`, and
-review-group manifests under `patches/kernel/`. The second applies the complete
-series with `git am` in a disposable worktree and compares its tree object with
-the source branch.
+The script writes the kernel patches plus `series` and `manifest.tsv` under
+`patches/kernel/`.
 
-Revdi and Chimera are directly tracked source, not a generated patch set.
+## Verify patch application
+
+```sh
+KERNEL_TREE=/path/to/vino-kernel ./tools/check-series.sh
+```
+
+The script creates temporary detached worktrees, applies the generated patches
+with `git am`, compares the resulting tree object with the named source head,
+and removes the worktrees.
+
+The combined validator also runs strict `checkpatch.pl` checks over the final
+EVDI and Vino consumer patches. The generic prerequisite series is left to its
+respective subsystem review and is not silently reformatted.
+
+## Kernel build
+
+The focused build used during cleanup is:
+
+```sh
+make -C kernel LLVM=1 -j16 \
+  rust/kernel.o \
+  drivers/gpu/drm/evdi/evdi.o \
+  drivers/gpu/drm/vino/vino.o
+```
+
+An external-module `modpost` requires a complete matching kernel build and
+`Module.symvers`; its absence is not a Rust compile failure.
+
+## EVDI and Chimera
+
+```sh
+git submodule update --init evdi
+make -C revdi test
+make -C revdi chimera
+```
+
+Tests cover the userspace workspace, protocol fixtures, mode profiles, video-arm
+construction, DDC/CI response bounds, pixel conversion, cursor repacking,
+padding, and codec framing. `make chimera` builds the stock C library from the
+EVDI submodule and compiles the live integration path.
 
 ## Combined validation
 
 ```sh
-./tools/validate.sh
+KERNEL_TREE=/path/to/vino-kernel ./tools/validate.sh
 ```
 
-For policy, patch-application, formatting, and source-sync checks without
-compilation:
+Use `SKIP_BUILD=1` for policy, patch, and synchronization checks only:
 
 ```sh
-SKIP_BUILD=1 ./tools/validate.sh
+KERNEL_TREE=/path/to/vino-kernel SKIP_BUILD=1 ./tools/validate.sh
 ```
 
-The build uses a temporary out-of-tree kernel output unless `KBUILD_OUTPUT` is
-provided. It compiles `rust/kernel.o`, `evdi.o`, and `vino.o`, then runs the
-Revdi/Chimera workspace, all-feature, library, and protocol-oracle tests.
+## Documentation
 
-Focused source commands are:
+The kernel document can be rendered through the normal kernel Sphinx target
+when Sphinx is already available:
 
 ```sh
-make -C revdi check-sync KSRC=../linux
-cargo test --manifest-path revdi/Cargo.toml --workspace --all-features
-cargo test --manifest-path revdi/library/Cargo.toml
+make -C kernel htmldocs SPHINXDIRS=gpu
 ```
 
-## Prepare a v3 posting
-
-Review groups are listed in `patches/kernel/groups/`. Generate a correctly
-renumbered v3 Vino draft:
-
-```sh
-./tools/send-series.sh vino --version 3
-```
-
-Edit `outgoing/vino-v3/v3-0000-cover-letter.patch`, then verify recipients and
-mail formatting without sending:
-
-```sh
-./tools/send-series.sh vino --version 3 --dry-run \
-  --to dri-devel@lists.freedesktop.org \
-  --cc rust-for-linux@vger.kernel.org
-```
-
-The helper delegates per-patch recipient discovery to the kernel's
-`scripts/get_maintainer.pl`. Transmission requires the separate, explicit
-`--send` option:
-
-```sh
-./tools/send-series.sh vino --version 3 --send \
-  --to dri-devel@lists.freedesktop.org \
-  --cc rust-for-linux@vger.kernel.org
-```
-
-The script refuses to dry-run or send while the generated cover letter still
-contains placeholders.
-
-## Kernel documentation
-
-When Sphinx is already installed:
-
-```sh
-make -C linux htmldocs SPHINXDIRS=gpu
-```
-
-No documentation packages are installed by the scripts.
+This cleanup did not install Sphinx or TeX packages. Missing documentation
+tooling should be reported as an environment prerequisite, not worked around by
+installing packages without permission.
 
 ## Hardware boundary
 
-Hardware validation remains deliberately manual. A release candidate should
-cover cold and warm plug, both heads, every advertised mode, rotations and
-reflections, mode changes, DPMS, cursor, monitor removal and reappearance, USB
-reset, suspend/resume, control-plane recovery, unload with open and closed DRM
-files, and sustained damage traffic.
-
-Building and installing the modules for a hardware run:
-
-```sh
-make -C linux LLVM=1 -j16 modules       # no `M=`
-sudo make -C linux modules_install
-sudo depmod -a
-```
-
-⛔ **Never put `M=` on a `modules_install` line.** `M=` sets `KBUILD_EXTMOD`, and
-`scripts/Makefile.modinst` then installs to `/lib/modules/$(uname -r)/updates/` rather than
-`kernel/...`. `depmod` *prefers* `updates/`, so a stray copy there silently shadows the real module
-and every later reinstall appears to do nothing — a failure that survives reboots and is invisible
-unless you look for it:
-
-```sh
-ls /lib/modules/$(uname -r)/updates/ 2>/dev/null   # must not exist
-modinfo -n vino                                     # must be under kernel/...
-```
-
-`make -C linux LLVM=1 M=drivers/gpu/drm/vino modules` is a safe, much faster **build-only**
-shortcut, but it only produces the `.ko` — place it yourself with `cp` into the matching
-`kernel/...` path and re-run `depmod -a`. ⚠ `make LLVM=1 drivers/gpu/drm/vino/` compiles objects
-only and yields no `.ko` at all.
-
-[`tools/hardware/`](../tools/hardware/README.md) supports that work:
-
-```sh
-sudo tools/hardware/vino-cycle.sh      # safe unbind/unload/load/rebind cycle
-sudo tools/hardware/vino-perf.py --secs 30
-```
-
-⚠ Never `modprobe -r` while a DRM file is open — it frees the fops under the
-compositor and hangs the machine. `vino-cycle.sh` refuses instead of forcing.
-
-⚠ `usbmon` is not autoloaded; `vino-perf.py` needs it.
-
-Capturing an unfamiliar device driving under DLM, rather than under Vino, is a
-separate exercise: see [`new-device-capture.md`](new-device-capture.md) and
-[`tools/capture/`](../tools/capture/README.md).
+Hardware testing is intentionally separate. A release candidate should later
+cover cold plug, warm plug, both heads, each supported mode, mode changes,
+DPMS, cursor, DDC/CI, monitor removal/reappearance, USB reset, suspend/resume,
+module unload with open and closed DRM files, and sustained damage traffic.
+That procedure may stop services or load modules and is therefore never run by
+the validation scripts.
